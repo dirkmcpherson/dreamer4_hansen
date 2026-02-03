@@ -10,4 +10,5 @@ TASK_SET = [
     'finger-turn-hard', 'hopper-stand', 'hopper-hop', 'walker-walk-backward', 'walker-run-backward',
     'cheetah-run-backward', 'cheetah-run-front', 'cheetah-run-back', 'cheetah-jump', 'hopper-hop-backward',
     'cup-spin', 'pendulum-spin', 'jumper-jump', 'reacher-three-easy', 'reacher-three-hard',
+    'pusht',
 ]

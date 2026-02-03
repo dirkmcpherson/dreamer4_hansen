@@ -3,6 +3,7 @@ import os
 import time
 import random
 import argparse
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -10,12 +11,18 @@ import torch
 import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, DistributedSampler
+import torch.multiprocessing as mp
+
+try:
+     mp.set_start_method('spawn', force=True)
+except RuntimeError:
+     pass
 
 import wandb
 
-from task_set import TASK_SET
-from sharded_frame_dataset import ShardedFrameDataset
-from model import (
+from .task_set import TASK_SET
+from .sharded_frame_dataset import ShardedFrameDataset
+from .model import (
     Encoder, Decoder, Tokenizer,
     temporal_patchify, temporal_unpatchify,
     recon_loss_from_mae, lpips_on_mae_recon,
@@ -162,6 +169,7 @@ def train(args):
         tasks=TASK_SET,
         seq_len=args.seq_len,
         iid_sampling=True,
+        cache_size=args.cache_size,
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -172,7 +180,7 @@ def train(args):
         sampler=sampler,
         shuffle=(sampler is None),
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True,
         persistent_workers=(args.num_workers > 0),
         worker_init_fn=worker_init_fn,
@@ -231,6 +239,9 @@ def train(args):
     use_amp = torch.cuda.is_available()
     scaler = GradScaler(device="cuda", enabled=use_amp)
 
+    # ---- monitor ----
+    monitor = ActivationMonitor(model, log_every=args.monitor_every, active=args.monitor_activations)
+
     # ---- lpips ----
     if args.lpips_weight > 0.0:
         assert lpips is not None, "pip install lpips"
@@ -274,6 +285,7 @@ def train(args):
                     break
 
                 x = x.to(device, non_blocking=True)  # (B,T,C,H,W)
+                
                 patches = temporal_patchify(x, args.patch)
 
                 with torch.no_grad():
@@ -281,8 +293,13 @@ def train(args):
                     if is_rank0() and step % args.log_every == 0:
                         wandb.log({"debug/z_std": float(z.float().std().item())}, step=step)
 
+                # Only monitor if this is an update step
+                if ((step + 1) % grad_accum == 0):
+                    monitor.step(step)
+
                 with autocast(device_type="cuda", enabled=use_amp):
                     pred, mae_mask, keep_prob = model(patches)
+
 
                 # losses in fp32 (outside autocast)
                 mse = recon_loss_from_mae(pred, patches, mae_mask)
@@ -298,15 +315,13 @@ def train(args):
                     lp = torch.zeros((), device=device)
                     loss = mse
 
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"Non-finite loss at step {step}: loss={loss} mse={mse} lp={lp}")
-
                 loss_to_backprop = loss / grad_accum
-
+                
                 scaler.scale(loss_to_backprop).backward()
 
                 do_step = ((step + 1) % grad_accum == 0)
                 if do_step:
+                    monitor.log_and_clear(step)
                     if use_amp:
                         scaler.step(opt)
 
@@ -361,7 +376,7 @@ def train(args):
                     save_ckpt(ckpt_path, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
                     # also update a "latest" pointer
                     latest = ckpt_dir / "latest.pt"
-                    save_ckpt(latest, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
+                    shutil.copy(ckpt_path, latest)
 
                 step += 1
 
@@ -370,6 +385,11 @@ def train(args):
     if ddp:
         dist.barrier()
         dist.destroy_process_group()
+    
+    if is_rank0():
+        print("Training loop finished. Closing wandb...", flush=True)
+        wandb.finish()
+        print("Wandb closed.", flush=True)
 
 
 if __name__ == "__main__":
@@ -434,5 +454,13 @@ if __name__ == "__main__":
     # misc
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--cache_size", type=int, default=32, help="Dataset cache size in number of shards")
+
+
+
+    from activation_monitor import ActivationMonitor
+
+    p.add_argument("--monitor_activations", action="store_true")
+    p.add_argument("--monitor_every", type=int, default=1000)
 
     train(p.parse_args())

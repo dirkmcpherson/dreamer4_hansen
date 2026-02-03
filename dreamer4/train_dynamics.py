@@ -12,13 +12,19 @@ import torch
 import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, DistributedSampler
+import torch.multiprocessing as mp
+
+try:
+     mp.set_start_method('spawn', force=True)
+except RuntimeError:
+     pass
 
 import wandb
 
-from task_set import TASK_SET
-from sharded_frame_dataset import ShardedFrameDataset
 
-from model import (
+from .sharded_frame_dataset import ShardedFrameDataset
+
+from .model import (
     Encoder, Decoder, Tokenizer,
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial,
@@ -108,13 +114,16 @@ def load_frozen_tokenizer_from_pt_ckpt(
     n_patches = (H // patch) * (W // patch)
     d_patch = patch * patch * C
 
+    enc_depth = int(tok_args.get("enc_depth", tok_args.get("depth", 8)))
+    dec_depth = int(tok_args.get("dec_depth", tok_args.get("depth", 8)))
+
     enc = Encoder(
         patch_dim=d_patch,
         d_model=int(tok_args.get("d_model", 256)),
         n_latents=int(tok_args.get("n_latents", 16)),
         n_patches=n_patches,
         n_heads=int(tok_args.get("n_heads", 4)),
-        depth=int(tok_args.get("depth", 8)),
+        depth=enc_depth,
         d_bottleneck=int(tok_args.get("d_bottleneck", 32)),
         dropout=0.0,
         mlp_ratio=float(tok_args.get("mlp_ratio", 4.0)),
@@ -127,7 +136,7 @@ def load_frozen_tokenizer_from_pt_ckpt(
         d_bottleneck=int(tok_args.get("d_bottleneck", 32)),
         d_model=int(tok_args.get("d_model", 256)),
         n_heads=int(tok_args.get("n_heads", 4)),
-        depth=int(tok_args.get("depth", 8)),
+        depth=dec_depth,
         n_latents=int(tok_args.get("n_latents", 16)),
         n_patches=n_patches,
         d_patch=d_patch,
@@ -178,6 +187,7 @@ def dynamics_pretrain_loss(
     *,
     z1: torch.Tensor,                    # (B,T,Sz,Dz) packed clean targets
     actions: Optional[torch.Tensor],     # (B,T) or None
+    rewards: Optional[torch.Tensor] = None, # (B,T) or None
     act_mask: Optional[torch.Tensor],    # (A,) or None
     k_max: int,
     B_self: int,
@@ -221,10 +231,27 @@ def dynamics_pretrain_loss(
     w_self = 0.9 * sigma_self + 0.1
 
     # Main forward
-    z1_hat_full, _ = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=agent_tokens)
+    # IMPORTANT: actions/rewards must be passed properly. This function signature needs updating to accept rewards tensor.
+    # We assume 'rewards' is passed effectively or we modify signature.
+    # Current signature: (dynamics, z1, actions, act_mask, k_max, B_self, step, bootstrap_start, agent_tokens)
+    # I need to add 'rewards' argument to signature or kwargs.
+    # But since I am using replace_file_content, I am editing the body.
+    # I'll rely on the user to make a separate edit to signature if needed.
+    # WAIT, I can assume 'rewards' is NOT available in this scope yet.
+    # I should update signature first. But let's assume 'rewards' is passed as argument.
+    
+    z1_hat_full, _, r_hat_full = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=agent_tokens)
+
     z1_hat_emp = z1_hat_full[:B_emp]
     z1_hat_self = z1_hat_full[B_emp:]
-
+    
+    # Reward Loss
+    # We need ground truth rewards. 
+    # Since I cannot easily change signature and call sites in one go, I will assume 'rewards' is available in scope 
+    # OR better, I will update signature in a separate edit.
+    # For now, I will just unpack the return to avoid crash, but NOT calculate reward loss yet.
+    # I will do that in the NEXT step properly.
+ 
     flow_per = (z1_hat_emp.float() - z1[:B_emp].float()).pow(2).mean(dim=(2, 3))  # (B_emp,T)
     loss_emp = (flow_per * w_emp).mean()
 
@@ -238,11 +265,11 @@ def dynamics_pretrain_loss(
         sigma_plus = sigma_self + d_half
         sigma_idx_plus = sigma_idx_self + (torch.tensor(k_max, device=device, dtype=torch.float32) * d_half).to(torch.long)
 
-        z1_hat_half1, _ = dynamics(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_self, z_tilde_self, act_mask=act_mask_self, agent_tokens=agent_tokens[B_emp:] if agent_tokens is not None else None)
+        z1_hat_half1, _, _ = dynamics(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_self, z_tilde_self, act_mask=act_mask_self, agent_tokens=agent_tokens[B_emp:] if agent_tokens is not None else None)
         b_prime = (z1_hat_half1.float() - z_tilde_self.float()) / (1.0 - sigma_self).clamp_min(1e-6)[..., None, None]
         z_prime = z_tilde_self.float() + b_prime * d_half[..., None, None]
 
-        z1_hat_half2, _ = dynamics(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_plus, z_prime.to(z_tilde_self.dtype), act_mask=act_mask_self, agent_tokens=agent_tokens[B_emp:] if agent_tokens is not None else None)
+        z1_hat_half2, _, _ = dynamics(actions[B_emp:] if actions is not None else None, step_idx_half, sigma_idx_plus, z_prime.to(z_tilde_self.dtype), act_mask=act_mask_self, agent_tokens=agent_tokens[B_emp:] if agent_tokens is not None else None)
         b_doubleprime = (z1_hat_half2.float() - z_prime.float()) / (1.0 - sigma_plus).clamp_min(1e-6)[..., None, None]
 
         vhat_sigma = (z1_hat_self.float() - z_tilde_self.float()) / (1.0 - sigma_self).clamp_min(1e-6)[..., None, None]
@@ -252,12 +279,25 @@ def dynamics_pretrain_loss(
         loss_self = (boot_per * w_self).mean()
         boot_mse = boot_per.mean()
 
+    # Reward loss (supervised on empirical data only)
+    reward_mse = torch.zeros((), device=device, dtype=torch.float32)
+    if rewards is not None:
+        # r_hat_full: (B, T)
+        r_hat_emp = r_hat_full[:B_emp]
+        rew_emp = rewards[:B_emp]
+        reward_mse = (r_hat_emp - rew_emp).pow(2).mean()
+        
+        # Add to loss_emp? Or separate? 
+        # Typically we balance terms. Start with 1.0 weight.
+        loss_emp = loss_emp + reward_mse
+
     # Combine losses
     loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
 
     aux = {
         "flow_mse": flow_per.mean().detach(),
         "bootstrap_mse": boot_mse.detach(),
+        "reward_mse": reward_mse.detach(),
         "loss_emp": loss_emp.detach(),
         "loss_self": loss_self.detach(),
         "sigma_mean": sigma_full.mean().detach(),
@@ -308,7 +348,7 @@ def sample_one_timestep_packed(
     sched: Dict[str, Any],
     actions: Optional[torch.Tensor] = None,     # (B,T,A) aligned to frames or None
     act_mask: Optional[torch.Tensor] = None,    # (B,T,A) or (A,) or None
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     device = past_packed.device
     dtype = past_packed.dtype
     B, t = past_packed.shape[:2]
@@ -344,7 +384,7 @@ def sample_one_timestep_packed(
         actions_in = None if actions is None else actions[:, : t + 1]
         actmask_in = None if act_mask is None else act_mask[:, : t + 1]
 
-        x1_hat_full, _ = dyn(
+        x1_hat_full, _, r_hat_full = dyn(
             actions_in,
             step_idxs_full,
             signal_idxs_full,
@@ -357,8 +397,16 @@ def sample_one_timestep_packed(
         denom = max(1e-4, 1.0 - tau_i)
         b = (x1_hat.float() - z.float()) / denom
         z = (z.float() + b * dt).to(dtype)
+    
+    # Return last reward prediction
+    # r_hat_full is (B, t+1) ? dyn returns rewards for all steps?
+    # Dynamics.forward returns r_hat with shape (B, T)
+    # Here input is t+1 length. So r_hat_full is (B, t+1)
+    # We want prediction for the LAST step (the one we just generated z for)
+    r_next = r_hat_full[:, -1] if r_hat_full is not None else None
 
-    return z[:, 0]  # (B,n_spatial,d_spatial)
+    return z[:, 0], r_next
+
 
 
 @torch.no_grad()
@@ -372,17 +420,18 @@ def sample_autoregressive_packed_sequence(
     sched: Dict[str, Any],
     actions: Optional[torch.Tensor] = None,     # (B,T,A) or None
     act_mask: Optional[torch.Tensor] = None,    # (B,T,A) or (A,) or None
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     B, T = z_gt_packed.shape[:2]
     L = min(T, ctx_length + horizon)
     ctx_length = min(ctx_length, L - 1)
     horizon = min(horizon, L - ctx_length)
 
     outs = [z_gt_packed[:, t] for t in range(ctx_length)]
+    rews = []
 
     for t in range(ctx_length, ctx_length + horizon):
         past = torch.stack(outs, dim=1)  # (B,t,...)
-        z_next = sample_one_timestep_packed(
+        z_next, r_next = sample_one_timestep_packed(
             dyn,
             past_packed=past,
             k_max=k_max,
@@ -391,8 +440,12 @@ def sample_autoregressive_packed_sequence(
             act_mask=act_mask,
         )
         outs.append(z_next)
+        if r_next is not None:
+            rews.append(r_next)
 
-    return torch.stack(outs, dim=1)
+    z_out = torch.stack(outs, dim=1)
+    r_out = torch.stack(rews, dim=1) if len(rews) > 0 else None
+    return z_out, r_out
 
 
 @torch.no_grad()
@@ -462,6 +515,7 @@ def run_dynamics_eval(
     dyn: Dynamics,
     frames: torch.Tensor,            # (B,T,C,H,W) float [0,1]
     actions: Optional[torch.Tensor],    # (B,T,A) or None
+    rewards: Optional[torch.Tensor],    # (B,T) or None
     act_mask: Optional[torch.Tensor], # (A,) or None
     H: int, W: int, C: int, patch: int,
     packing_factor: int,
@@ -491,7 +545,7 @@ def run_dynamics_eval(
     actions_eval = None if actions is None else actions[:, :T_eval]
     act_mask_eval = None if act_mask is None else act_mask[:, :T_eval] if act_mask.dim() == 3 else act_mask
 
-    z_pred_packed = sample_autoregressive_packed_sequence(
+    z_pred_packed, r_pred = sample_autoregressive_packed_sequence(
         dyn,
         z_gt_packed=z_gt_packed,
         ctx_length=ctx_length,
@@ -560,6 +614,18 @@ def run_dynamics_eval(
             step=step,
         )
 
+    # Log Reward MSE
+    if r_pred is not None and rewards is not None:
+        # rewards shape (B, T)
+        # r_pred shape (B, Horizon)
+        # We need to extract GT rewards corresponding to the horizon
+        # Horizon starts at ctx_length.
+        gt_rew_h = rewards[:, ctx_length:ctx_length + horizon] # (B, H)
+        
+        if gt_rew_h.shape == r_pred.shape:
+            mse_rew = (r_pred - gt_rew_h).pow(2).mean()
+            wandb.log({"eval/reward_mse": float(mse_rew.item())}, step=step)
+
     log_dynamics_eval_wandb(
         gt=frames_eval,
         pred=pred_frames,
@@ -586,11 +652,12 @@ def train(args):
             data_dir=args.data_dirs,
             frames_dir=args.frame_dirs,
             seq_len=args.seq_len,
-            img_size=128,
-            action_dim=16,
+            img_size=(args.H if args.H is not None else 128),
+            action_dim=args.action_dim,
             tasks_json=args.tasks_json,
             tasks=TASK_SET,
             verbose=is_rank0(),
+            cache_mb=args.cache_mb,
         )
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
         loader = DataLoader(
@@ -599,7 +666,7 @@ def train(args):
             sampler=sampler,
             shuffle=(sampler is None),
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=True,
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
@@ -618,7 +685,7 @@ def train(args):
             sampler=sampler,
             shuffle=(sampler is None),
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=True,
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
@@ -685,6 +752,8 @@ def train(args):
     use_amp = torch.cuda.is_available()
     scaler = GradScaler(device="cuda", enabled=use_amp)
 
+    monitor = ActivationMonitor(dyn, log_every=args.monitor_every, active=args.monitor_activations)
+
     # Initialize wandb
     if is_rank0():
         wandb.init(
@@ -731,10 +800,22 @@ def train(args):
                     actions[:, 1:] = act[:, :-1]
                     act_mask = torch.zeros_like(mask)
                     act_mask[:, 1:] = mask[:, :-1]
+                    
+                    # Rewards
+                    # batch["rew"] is (B,T). We align it similarly?
+                    # Typically we predict r_t given s_t. 
+                    # If obs[t] -> act[t] -> rew[t] -> obs[t+1]
+                    # Dreamer usually predicts r_t from s_t.
+                    # batch["rew"] from WMDataset is aligned with act.
+                    # WMDataset __getitem__: rew = self.rew[...][start+1:...]
+                    # So rew[t] is reward received AFTER transition from t to t+1?
+                    # Let's assume standard alignment.
+                    rewards = batch["rew"].to(device, non_blocking=True)
                 else:
                     frames = batch.to(device, non_blocking=True)                 # (B,T,3,H,W)
                     actions = None
                     act_mask = None
+                    rewards = None
 
                 # Safeguard: convert to [0, 1] if dataset returns uint8
                 if frames.dtype == torch.uint8:
@@ -748,16 +829,25 @@ def train(args):
 
                 if actions is not None:
                     actions = actions.to(device, non_blocking=True)
+                
+                if rewards is not None:
+                    rewards = rewards.to(device, non_blocking=True)
 
                 B = z1.shape[0]
                 B_self = int(round(args.self_fraction * B))
                 B_self = max(0, min(B - 1, B_self))
+
+                B_self = max(0, min(B - 1, B_self))
+
+                if ((step + 1) % grad_accum == 0):
+                    monitor.step(step)
 
                 with autocast(device_type="cuda", enabled=use_amp):
                     loss, aux = dynamics_pretrain_loss(
                         dyn.module if hasattr(dyn, "module") else dyn,
                         z1=z1,
                         actions=actions,
+                        rewards=rewards,
                         act_mask=act_mask,
                         k_max=args.k_max,
                         B_self=B_self,
@@ -787,6 +877,7 @@ def train(args):
                     else:
                         opt.step()
                     opt.zero_grad(set_to_none=True)
+                    monitor.log_and_clear(step)
 
                 # Evaluation / visualization
                 if is_rank0() and args.eval_every > 0 and (step % args.eval_every == 0):
@@ -938,9 +1029,10 @@ if __name__ == "__main__":
     p.add_argument("--k_max", type=int, default=8)
     p.add_argument("--bootstrap_start", type=int, default=5_000)
     p.add_argument("--self_fraction", type=float, default=0.25)
-
+    
     # actions
     p.add_argument("--use_actions", action="store_true")
+    p.add_argument("--action_dim", type=int, default=16)
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)
@@ -975,4 +1067,22 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--compile", action="store_true")
 
-    train(p.parse_args())
+
+
+    from activation_monitor import ActivationMonitor
+
+    p.add_argument("--monitor_activations", action="store_true")
+    p.add_argument("--monitor_every", type=int, default=1000)
+    
+    p.add_argument("--cache_mb", type=int, default=2048, help="WMDataset cache size in MB")
+
+    try:
+        train(p.parse_args())
+    except Exception as e:
+        print(f"Training failed with error: {e}")
+        raise e
+    finally:
+        if wandb.run is not None:
+            print("Closing wandb...", flush=True)
+            wandb.finish()
+            print("Wandb closed.", flush=True)
