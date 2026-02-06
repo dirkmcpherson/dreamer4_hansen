@@ -1069,7 +1069,7 @@ if __name__ == "__main__":
 
 
 
-    from activation_monitor import ActivationMonitor
+    from .activation_monitor import ActivationMonitor
 
     p.add_argument("--monitor_activations", action="store_true")
     p.add_argument("--monitor_every", type=int, default=1000)

@@ -465,9 +465,11 @@ class Tokenizer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
 
-    def forward(self, patches_btnd: torch.Tensor):
+    def forward(self, patches_btnd: torch.Tensor, return_z: bool = False):
         z, (mae_mask, keep_prob) = self.encoder(patches_btnd)
         pred = self.decoder(z)
+        if return_z:
+            return pred, mae_mask, keep_prob, z
         return pred, mae_mask, keep_prob
 
 
@@ -744,3 +746,43 @@ def lpips_on_mae_recon(
     with torch.autocast(device_type="cuda", enabled=False):
         lp = lpips_fn(recon, tgt)
     return lp.mean()
+
+
+class Actor(nn.Module):
+    def __init__(self, d_model: int, action_dim: int, hidden: int = 256, min_std: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 2 * action_dim),
+        )
+        self.min_std = min_std
+
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # z: (B, T, D)
+        x = self.net(z)
+        mean, std = x.chunk(2, dim=-1)
+        std = F.softplus(std) + self.min_std
+        return mean, std
+
+
+class Critic(nn.Module):
+    def __init__(self, d_model: int, hidden: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: (B, T, D)
+        return self.net(z).squeeze(-1)
