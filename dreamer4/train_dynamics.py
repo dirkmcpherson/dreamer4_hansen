@@ -215,8 +215,32 @@ def dynamics_pretrain_loss(
         step_idx_self = torch.zeros((0, T), device=device, dtype=torch.long)
         step_idx_full = step_idx_emp
 
-    # sigma/tau per row/time
     sigma_full, sigma_idx_full = _sample_tau_for_step(device, B, T, k_max, step_idx_full)
+
+    # --- LOW-SIGMA BIAS (keeps sigma_idx_full consistent) ---
+    # We restrict j_idx/K to lie in [lo, hi] by re-sampling sigma_idx_full directly,
+    # then recomputing sigma_full from sigma_idx_full and the per-row step size.
+    lo, hi = 0.05, 0.35  # tune
+    emax = _emax_from_kmax(k_max)
+    K_full = (1 << step_idx_full).to(torch.long)                 # (B,T)
+    scale_full = torch.div(torch.tensor(k_max, device=device), K_full, rounding_mode="floor")  # (B,T)
+    # sigma_idx_full corresponds to tau_idx = j_idx * scale, so j_idx = sigma_idx_full / scale.
+    # We sample tau_idx directly in [lo*k_max, hi*k_max) but snap to the grid implied by 'scale_full'.
+    tau_lo = int(math.floor(lo * k_max))
+    tau_hi = int(math.ceil (hi * k_max))
+    tau_hi = max(tau_lo + 1, min(k_max, tau_hi))
+
+    u = torch.randint(low=tau_lo, high=tau_hi, size=(B, T), device=device, dtype=torch.long)  # desired tau_idx
+    # snap to valid grid (multiple of scale_full)
+    sigma_idx_full = (u // scale_full.clamp_min(1)) * scale_full.clamp_min(1)
+    sigma_idx_full = sigma_idx_full.clamp(0, k_max - 1)
+
+    # recompute sigma_full from sigma_idx_full and scale_full:
+    j_idx = sigma_idx_full // scale_full.clamp_min(1)
+    sigma_full = j_idx.to(torch.float32) / K_full.to(torch.float32)
+    # --- END LOW-SIGMA BIAS ---
+
+
     sigma_emp = sigma_full[:B_emp]
     sigma_self = sigma_full[B_emp:]
     sigma_idx_self = sigma_idx_full[B_emp:]
@@ -227,8 +251,11 @@ def dynamics_pretrain_loss(
     z_tilde_self = z_tilde_full[B_emp:]
 
     # Weights
-    w_emp = 0.9 * sigma_emp + 0.1
-    w_self = 0.9 * sigma_self + 0.1
+    # w_emp = 0.9 * sigma_emp + 0.1
+    # w_self = 0.9 * sigma_self + 0.1 # JS
+
+    w_emp  = 0.9 * (1.0 - sigma_emp)  + 0.1
+    w_self = 0.9 * (1.0 - sigma_self) + 0.1
 
     # Main forward
     # IMPORTANT: actions/rewards must be passed properly. This function signature needs updating to accept rewards tensor.
@@ -246,11 +273,7 @@ def dynamics_pretrain_loss(
     z1_hat_self = z1_hat_full[B_emp:]
     
     # Reward Loss
-    # We need ground truth rewards. 
-    # Since I cannot easily change signature and call sites in one go, I will assume 'rewards' is available in scope 
-    # OR better, I will update signature in a separate edit.
-    # For now, I will just unpack the return to avoid crash, but NOT calculate reward loss yet.
-    # I will do that in the NEXT step properly.
+    # Check if reward head is present (legacy support or if re-added later)
  
     flow_per = (z1_hat_emp.float() - z1[:B_emp].float()).pow(2).mean(dim=(2, 3))  # (B_emp,T)
     loss_emp = (flow_per * w_emp).mean()
@@ -281,14 +304,13 @@ def dynamics_pretrain_loss(
 
     # Reward loss (supervised on empirical data only)
     reward_mse = torch.zeros((), device=device, dtype=torch.float32)
-    if rewards is not None:
+    if rewards is not None and r_hat_full is not None:
         # r_hat_full: (B, T)
         r_hat_emp = r_hat_full[:B_emp]
         rew_emp = rewards[:B_emp]
         reward_mse = (r_hat_emp - rew_emp).pow(2).mean()
         
-        # Add to loss_emp? Or separate? 
-        # Typically we balance terms. Start with 1.0 weight.
+        # Add to loss_emp
         loss_emp = loss_emp + reward_mse
 
     # Combine losses
@@ -1013,21 +1035,21 @@ if __name__ == "__main__":
     p.add_argument("--patch", type=int, default=None)
 
     # dynamics arch
-    p.add_argument("--d_model_dyn", type=int, default=512)
-    p.add_argument("--dyn_depth", type=int, default=8)
+    p.add_argument("--d_model_dyn", type=int, default=256)
+    p.add_argument("--dyn_depth", type=int, default=4)
     p.add_argument("--n_heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--mlp_ratio", type=float, default=4.0)
-    p.add_argument("--time_every", type=int, default=1)
+    p.add_argument("--time_every", type=int, default=4)
 
-    p.add_argument("--packing_factor", type=int, default=2)
-    p.add_argument("--n_register", type=int, default=4)
-    p.add_argument("--n_agent", type=int, default=1)
+    p.add_argument("--packing_factor", type=int, default=1)
+    p.add_argument("--n_register", type=int, default=0)
+    p.add_argument("--n_agent", type=int, default=0)
     p.add_argument("--space_mode", type=str, default="wm_agent_isolated", choices=["wm_agent_isolated", "wm_agent"])
 
     # shortcut / schedule
-    p.add_argument("--k_max", type=int, default=8)
-    p.add_argument("--bootstrap_start", type=int, default=5_000)
+    p.add_argument("--k_max", type=int, default=16)
+    p.add_argument("--bootstrap_start", type=int, default=1000)
     p.add_argument("--self_fraction", type=float, default=0.25)
     
     # actions
@@ -1035,23 +1057,23 @@ if __name__ == "__main__":
     p.add_argument("--action_dim", type=int, default=16)
 
     # optim
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_steps", type=int, default=10_000_000)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--grad_clip", type=float, default=1.0)
 
     # eval / viz
-    p.add_argument("--eval_every", type=int, default=1_000)
+    p.add_argument("--eval_every", type=int, default=1000)
     p.add_argument("--eval_batch_size", type=int, default=4)
     p.add_argument("--eval_max_items", type=int, default=4)
-    p.add_argument("--eval_ctx", type=int, default=8)
-    p.add_argument("--eval_horizon", type=int, default=16)
+    p.add_argument("--eval_ctx", type=int, default=4)
+    p.add_argument("--eval_horizon", type=int, default=12)
     p.add_argument("--eval_schedule", type=str, default="shortcut", choices=["finest", "shortcut"])
     p.add_argument("--eval_d", type=float, default=0.25)
 
     # logging
-    p.add_argument("--log_every", type=int, default=200)
+    p.add_argument("--log_every", type=int, default=100)
 
     # wandb
     p.add_argument("--wandb_project", type=str, default="dreamer4-dynamics")

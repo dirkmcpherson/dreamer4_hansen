@@ -24,6 +24,31 @@ def set_mae_p(model, p):
             m.p_min = float(p)
             m.p_max = float(p)
 
+def tstats(name, x):
+    if x is None:
+        print(f"{name}: None")
+        return
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
+    if not torch.is_tensor(x):
+        print(f"{name}: type={type(x)}")
+        return
+    xd = x.detach()
+    finite = torch.isfinite(xd)
+    fin_ratio = finite.float().mean().item()
+    if fin_ratio < 1.0:
+        xd = xd[finite]
+    if xd.numel() == 0:
+        print(f"{name}: all non-finite")
+        return
+    print(
+        f"{name}: shape={tuple(x.shape)} dtype={x.dtype} dev={x.device} "
+        f"min={xd.min().item():+.4f} max={xd.max().item():+.4f} "
+        f"mean={xd.mean().item():+.4f} std={xd.std(unbiased=False).item():+.4f} "
+        f"finite={fin_ratio*100:.1f}%"
+    )
+
+
 # Add parent directory to path to pick up dreamer4 package
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -215,10 +240,11 @@ def main():
     parser.add_argument("--max_steps", type=int, default=200000)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--ckpt_dir", type=str, default=".")
+    parser.add_argument("--verbose", action="store_true")
     
     # Dynamics Config
-    parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--d_model_dyn", type=int, default=256)
+    parser.add_argument("--dyn_depth", type=int, default=4)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--k_max", type=int, default=16)
     parser.add_argument("--packing_factor", type=int, default=1)
@@ -226,24 +252,42 @@ def main():
     parser.add_argument("--mlp_ratio", type=float, default=4.0)
     parser.add_argument("--time_every", type=int, default=4)
     parser.add_argument("--space_mode", type=str, default="wm_agent_isolated")
+    parser.add_argument("--n_register", type=int, default=0)
+    parser.add_argument("--n_agent", type=int, default=0)
     
     # Training args
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=3e-4) # Unified default
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=1)
-    parser.add_argument("--save_every", type=int, default=5000)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--save_every", type=int, default=10000)
     parser.add_argument("--force_retrain", action="store_true")
+    parser.add_argument("--action_dim", type=int, default=2)
     
+    # Shortcut / self-supervision
+    parser.add_argument("--bootstrap_start", type=int, default=1000)
+    parser.add_argument("--self_fraction", type=float, default=0.25)
+
     # Wandb
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true")
 
-    parser.add_argument("--monitor_every", type=int, default=1000)
+    parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument("--monitor_every", type=int, default=1000) # Re-added for viz
     parser.add_argument("--monitor_activations", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    
+    # Eval / Viz
+    parser.add_argument("--eval_every", type=int, default=1000)
+    parser.add_argument("--eval_batch_size", type=int, default=4)
+    parser.add_argument("--eval_max_items", type=int, default=4)
+    parser.add_argument("--eval_ctx", type=int, default=4)
+    parser.add_argument("--eval_horizon", type=int, default=12)
+    parser.add_argument("--eval_schedule", type=str, default="finest", choices=["finest", "shortcut"])
+    parser.add_argument("--eval_d", type=float, default=0.25)
 
     args = parser.parse_args()
 
@@ -259,7 +303,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    seed_everything(42)
+    seed_everything(random.randint(1, 1000000))
 
     # Wandb Init
     if (args.wandb_project) and not args.no_wandb:
@@ -349,20 +393,20 @@ def main():
 
     print("Initializing Dynamics...")
     dyn = Dynamics(
-        d_model=args.d_model,
+        d_model=args.d_model_dyn,
         d_bottleneck=d_bottleneck,
         d_spatial=d_spatial,
         n_spatial=n_spatial,
-        n_register=0,
-        n_agent=0,
+        n_register=args.n_register,
+        n_agent=args.n_agent,
         n_heads=args.n_heads,
-        depth=args.depth,
+        depth=args.dyn_depth,
         k_max=args.k_max,
         dropout=args.dropout,
         mlp_ratio=args.mlp_ratio,
         time_every=args.time_every,
         space_mode=args.space_mode,
-        action_dim=2 # PushT action dim
+        action_dim=args.action_dim
     ).to(device)
     
     if args.compile:
@@ -370,7 +414,9 @@ def main():
         
     optimizer = optim.AdamW(dyn.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     use_amp = torch.cuda.is_available()
-    scaler = GradScaler(device="cuda", enabled=use_amp)
+
+    use_amp = (device.type == "cuda")
+    scaler = GradScaler(enabled=use_amp)
     
     if ActivationMonitor is not None:
          monitor = ActivationMonitor(dyn, log_every=args.monitor_every, active=args.monitor_activations)
@@ -503,31 +549,201 @@ def main():
             rewards = batch['rewards'].to(device, non_blocking=True)
             act_mask = batch['act_mask'].to(device, non_blocking=True)
             
+            # --- NORMALIZE ACTIONS TO [-1, 1] ---
+            # PushT demos use pixel coordinates (~0..512)
+            # ActionEncoder expects [-1,1]
+            actions = (actions / 256.0) - 1.0
+            actions = actions.clamp(-1, 1)
+
+            if step % 200 == 0 and args.verbose:
+                print(f"actions_norm range: [{actions.min().item():.3f}, {actions.max().item():.3f}] "
+                    f"mean={actions.mean().item():.3f} std={actions.std(unbiased=False).item():.3f}")
+
+
             if frames.dtype == torch.uint8:
                 frames = frames.float() / 255.0
+
+
+            if step % 200 == 0 and args.verbose:
+                print("\n=== BATCH SANITY ===")
+                tstats("frames", frames)
+                tstats("actions_raw", actions)
+                tstats("rewards_raw", rewards)
+                tstats("act_mask", act_mask)
+
+                # Quick guess: are actions pixels [0,512] or normalized [-1,1]?
+                a_min = actions.detach().min().item()
+                a_max = actions.detach().max().item()
+                if a_min >= 0.0 and a_max > 2.0:
+                    print("NOTE: actions look UNNORMALIZED (likely pixel coords). Consider normalizing to [-1,1].")
+                elif a_min >= -1.2 and a_max <= 1.2:
+                    print("NOTE: actions look normalized to ~[-1,1].")
+                else:
+                    print("NOTE: actions have unusual range; verify ActionEncoder expectation.")
+
+
+
+            # --- DEBUG: flip this to compare alignment ---
+            DEBUG_SHIFT_ACTIONS = False   # set False to test "no shift"
+            DEBUG_SHIFT_REWARDS = False
+
+            if DEBUG_SHIFT_ACTIONS:
+                actions_shifted = torch.zeros_like(actions)
+                actions_shifted[:, 1:] = actions[:, :-1]
+                actions_raw = actions
+                actions = actions_shifted
+
+            if DEBUG_SHIFT_REWARDS:
+                rewards_shifted = torch.zeros_like(rewards)
+                rewards_shifted[:, 1:] = rewards[:, :-1]
+                rewards_raw = rewards
+                rewards = rewards_shifted
+
+            # if step % 200 == 0:
+            #     print("\n=== AFTER SHIFT ===")
+            #     tstats("actions_used", actions)
+            #     tstats("rewards_used", rewards)
+
 
             # Causal Shift:
             # frames[t] is s_t.
             # a[t] is action taken at s_t (leads to s_{t+1}).
             # Model at step t (predicting z_t) should see a_{t-1}.
             # So we shift actions right by 1.
-            actions_shifted = torch.zeros_like(actions)
-            actions_shifted[:, 1:] = actions[:, :-1]
-            actions = actions_shifted
+            # actions_shifted = torch.zeros_like(actions)
+            # actions_shifted[:, 1:] = actions[:, :-1]
+            # actions = actions_shifted
             
-            # Same for rewards: r_{t-1} is reward received arriving at s_t (or from s_{t-1}, a_{t-1})
-            rewards_shifted = torch.zeros_like(rewards)
-            rewards_shifted[:, 1:] = rewards[:, :-1]
-            rewards = rewards_shifted
+            # # Same for rewards: r_{t-1} is reward received arriving at s_t (or from s_{t-1}, a_{t-1})
+            # rewards_shifted = torch.zeros_like(rewards)
+            # rewards_shifted[:, 1:] = rewards[:, :-1]
+            # rewards = rewards_shifted
 
             # Encode with frozen tokenizer
             with torch.no_grad():
                 patches = temporal_patchify(frames, patch)
+
+
+                if step % 500 == 0 and args.verbose:
+                    print("\n=== TOKENIZER ROUNDTRIP ===")
+                    with torch.no_grad():
+                        # Encode
+                        z_btLd, (mae_mask, keep_prob) = tok.encoder(patches)
+                        tstats("mae_mask.mean", mae_mask.float().mean())
+                        tstats("keep_prob", keep_prob)
+                        tstats("z_btLd", z_btLd)
+
+                        # Decode
+                        recon_patches = dec(z_btLd)
+                        recon_frames = temporal_unpatchify(recon_patches, H_img, W_img, 3, patch).clamp(0,1)
+
+                        # Metrics
+                        mse = (recon_frames - frames).float().pow(2).mean().item()
+                        mae = (recon_frames - frames).float().abs().mean().item()
+                        print(f"recon mse={mse:.6f}  mae={mae:.6f}")
+
+                        # Range sanity
+                        tstats("recon_frames", recon_frames)
+
                 # Use Tokenizer to extract latents consistently. 
                 # This ensures we get exactly what the decoder expects.
                 # _, _, _, z_btLd = tok(patches, return_z=True)
                 z_btLd, _ = tok.encoder(patches)
+
+
+                if step % 500 == 0 and args.verbose:
+                    print("\n=== LATENT STABILITY ===")
+                    with torch.no_grad():
+                        # z_btLd: (B,T,L,D)
+                        dz = (z_btLd[:, 1:] - z_btLd[:, :-1]).float()
+                        per_t = dz.pow(2).mean(dim=(0,2,3))  # (T-1,)
+                        print("mean dz^2 per timestep:", [float(x) for x in per_t.cpu()])
+                        print("overall dz^2:", float(dz.pow(2).mean().cpu()))
+
                 z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=args.packing_factor)
+
+
+            if step % 1000 == 0:
+                print("\n=== ACTION SENSITIVITY ===")
+                with torch.no_grad():
+                    # real
+                    loss_real, _ = dynamics_pretrain_loss(
+                        dyn, z1=z1, actions=actions, rewards=rewards, act_mask=act_mask,
+                        k_max=args.k_max, B_self=0, step=step, bootstrap_start=1000
+                    )
+
+                    # zeroed actions
+                    actions_zero = torch.zeros_like(actions)
+                    loss_zero, _ = dynamics_pretrain_loss(
+                        dyn, z1=z1, actions=actions_zero, rewards=rewards, act_mask=act_mask,
+                        k_max=args.k_max, B_self=0, step=step, bootstrap_start=1000
+                    )
+
+                    # permuted batch actions
+                    perm = torch.randperm(actions.shape[0], device=actions.device)
+                    loss_perm, _ = dynamics_pretrain_loss(
+                        dyn, z1=z1, actions=actions[perm], rewards=rewards, act_mask=act_mask,
+                        k_max=args.k_max, B_self=0, step=step, bootstrap_start=1000
+                    )
+
+                    print(f"loss_real={loss_real.item():.9f}  loss_zero={loss_zero.item():.9f}  loss_perm={loss_perm.item():.9f}")
+
+            if step % 1000 == 0:
+                print("\n=== ACTION EFFECT PROBE ===")
+                with torch.no_grad():
+                    B, T = z1.shape[:2]
+
+                    # Use a fixed corruption so comparisons are meaningful
+                    step_idxs = torch.full((B, T), int(round(math.log2(args.k_max))), device=z1.device, dtype=torch.long)  # emax (finest)
+                    signal_idxs = torch.full((B, T), args.k_max - 1, device=z1.device, dtype=torch.long)                  # near-clean
+
+                    # Build a fixed z_tilde (use the same noise for all variants)
+                    sigma = torch.full((B, T), 0.5, device=z1.device, dtype=z1.dtype)  # fixed corruption strength
+                    z0 = torch.randn_like(z1)
+                    z_tilde = (1.0 - sigma)[..., None, None] * z0 + sigma[..., None, None] * z1
+
+                    # Variant actions
+                    a_real = actions
+                    a_zero = torch.zeros_like(actions)
+                    perm = torch.randperm(B, device=z1.device)
+                    a_perm = actions[perm]
+
+                    # Forward
+                    y_real, _, _ = dyn(a_real, step_idxs, signal_idxs, z_tilde, act_mask=act_mask)
+                    y_zero, _, _ = dyn(a_zero, step_idxs, signal_idxs, z_tilde, act_mask=act_mask)
+                    y_perm, _, _ = dyn(a_perm, step_idxs, signal_idxs, z_tilde, act_mask=act_mask)
+
+                    # Measure effect sizes
+                    d_rz = (y_real - y_zero).float().pow(2).mean().sqrt().item()
+                    d_rp = (y_real - y_perm).float().pow(2).mean().sqrt().item()
+                    y_std = y_real.float().std(unbiased=False).item()
+
+                    print(f"||y_real - y_zero||_rms = {d_rz:.6e}")
+                    print(f"||y_real - y_perm||_rms = {d_rp:.6e}")
+                    print(f"std(y_real)            = {y_std:.6e}")
+
+                    def probe(actions_in, tag):
+                        y_real, _, _ = dyn(actions_in, step_idxs, signal_idxs, z_tilde, act_mask=act_mask)
+                        y_zero, _, _ = dyn(torch.zeros_like(actions_in), step_idxs, signal_idxs, z_tilde, act_mask=act_mask)
+                        d = (y_real - y_zero).float().pow(2).mean().sqrt().item()
+                        print(f"[{tag}] ||y_real - y_zero||_rms = {d:.6e}")
+
+                    # (build step_idxs, signal_idxs, sigma, z0, z_tilde exactly like your current probe)
+                    # probe(actions_raw,  "NO_SHIFT")
+                    # probe(actions_shifted, "SHIFTED")
+
+
+                    # for sigma_val in [0.1, 0.3, 0.5, 0.8]:
+                    #     sigma = torch.full((B, T), sigma_val, device=z1.device, dtype=z1.dtype)
+                    #     z0 = torch.randn_like(z1)
+                    #     z_tilde = (1.0 - sigma)[..., None, None] * z0 + sigma[..., None, None] * z1
+
+                    #     y_real, _, _ = dyn(actions, step_idxs, signal_idxs, z_tilde, act_mask=act_mask)
+                    #     y_zero, _, _ = dyn(torch.zeros_like(actions), step_idxs, signal_idxs, z_tilde, act_mask=act_mask)
+
+                    #     d = (y_real - y_zero).float().pow(2).mean().sqrt().item()
+                    #     print(f"sigma={sigma_val:.1f}  ||y_real - y_zero|| = {d:.6e}")
+
 
             # Train step
             if (step + 1) % grad_accum == 0:
@@ -538,39 +754,65 @@ def main():
                  if (step + 1) % grad_accum == 0:
                     monitor.step(step)
 
-            with autocast(device_type="cuda", enabled=use_amp):
+            B = z1.shape[0]
+            B_self = int(round(args.self_fraction * B))
+            B_self = max(0, min(B - 1, B_self))
+
+            with autocast(device_type=device.type, enabled=use_amp):
                  loss, aux = dynamics_pretrain_loss(
                     dyn,
                     z1=z1,
                     actions=actions, 
-                    # rewards=rewards, # dynamics_pretrain_loss signature in library MIGHT NOT have rewards yet. 
-                    # I checked earlier and thought it didn't. 
-                    # But if I align with library, library has it?
-                    # Let's check `dreamer4/train_dynamics.py` again?
-                    # I saw lines 182+ of `train_dynamics.py` in previous view.
-                    # It had: def dynamics_pretrain_loss(..., actions, rewards=None, ...) 
-                    # WAIT, line 231 comment said: "IMPORTANT: actions/rewards must be passed properly... I need to add 'rewards' argument"
-                    # And I saw line 187: rewards: Optional[torch.Tensor] = None
-                    # So it DOES have rewards. Good.
                     rewards=rewards,
                     act_mask=act_mask,
                     k_max=args.k_max,
-                    B_self=0 if step < 20000 else args.batch_size // 2, 
+                    B_self=B_self, 
                     step=step,
-                    bootstrap_start=1000
+                    bootstrap_start=args.bootstrap_start
                 )
             
             loss_to_backprop = loss / grad_accum
             scaler.scale(loss_to_backprop).backward()
-            
-            if (step + 1) % grad_accum == 0:
-                if monitor is not None:
-                    monitor.log_and_clear(step)
-                    
+
+
+
+            do_step = ((step + 1) % grad_accum == 0)
+            if do_step:
+                # IMPORTANT: unscale before clipping, otherwise clip is meaningless
+                scaler.unscale_(optimizer)
+
+                if step % 200 == 0 and args.verbose:
+                    print("\n=== GRAD SANITY ===")
+                    total_norm = 0.0
+                    n = 0
+                    for p in dyn.parameters():
+                        if p.grad is None:
+                            continue
+                        g = p.grad.detach()
+                        if torch.isfinite(g).all():
+                            total_norm += g.float().pow(2).sum().item()
+                            n += g.numel()
+                    total_norm = math.sqrt(total_norm) if total_norm > 0 else 0.0
+                    print(f"grad_l2={total_norm:.6f}  grad_elems={n}")
+
+                # ---- GRAD CLIP HERE ----
+                grad_norm = torch.nn.utils.clip_grad_norm_(dyn.parameters(), max_norm=args.grad_clip)
+
+                # optional debug
+                if step % 200 == 0:
+                    print(f"grad_norm (pre-clip) = {float(grad_norm):.3f}")
+
+                # AMP step
                 scaler.step(optimizer)
                 scaler.update()
-            
-            if step % 100 == 0:
+
+                # clear grads for next accumulation cycle
+                optimizer.zero_grad(set_to_none=True)
+
+                if monitor is not None:
+                    monitor.log_and_clear(step)
+                                
+            if step % args.log_every == 0:
                 if (args.wandb_project) and not args.no_wandb:
                    log_dict = {"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"]}
                    # Add aux
@@ -580,29 +822,52 @@ def main():
                 print(f"Step {step}: Loss = {loss.item():.4f}")
             
             # Visualization
-            if step > 0 and step % args.monitor_every == 0:
+            if args.eval_every > 0 and step % args.eval_every == 0 and step > 0:
                 print(f"Running evaluation at step {step}...")
                 
                 # Setup schedule
-                sched = make_tau_schedule(k_max=args.k_max, schedule="finest")
-                
+                sched = make_tau_schedule(k_max=args.k_max, schedule=args.eval_schedule, d=args.eval_d)
+                                
                 run_dynamics_eval(
                     encoder=enc,
                     decoder=dec,
                     dyn=dyn,
-                    frames=frames,  # Use current batch for eval
+                    frames=frames,
                     actions=actions if 'actions' in locals() else None,
                     rewards=rewards if 'rewards' in locals() else None,
                     act_mask=act_mask if 'act_mask' in locals() else None,
-                    H=H_img, W=W_img, C=3, 
+                    H=H_img, W=W_img, C=3,
                     patch=patch,
                     packing_factor=args.packing_factor,
                     k_max=args.k_max,
-                    ctx_length=4, # Use first 4 frames as context
-                    horizon=12,   # Predict next 12
+                    ctx_length=args.eval_ctx,
+                    horizon=args.eval_horizon,
                     sched=sched,
-                    max_items=4,
+                    max_items=args.eval_max_items,
                     step=step
+                )
+
+            # Checkpointing
+            if args.save_every > 0 and (step % args.save_every == 0) and step > 0:
+                print(f"Saving checkpoint at step {step}...")
+                ckpt_path = os.path.join(args.ckpt_dir, f"dynamics_step_{step:07d}.pt")
+                save_ckpt(
+                    Path(ckpt_path), 
+                    step=step, 
+                    dyn_model=dyn, 
+                    opt=optimizer, 
+                    scaler=scaler, 
+                    args=args
+                )
+                # Also save latest
+                latest_path = os.path.join(args.ckpt_dir, "dynamics_latest.pt")
+                save_ckpt(
+                    Path(latest_path), 
+                    step=step, 
+                    dyn_model=dyn, 
+                    opt=optimizer, 
+                    scaler=scaler, 
+                    args=args
                 )
 
             step += 1

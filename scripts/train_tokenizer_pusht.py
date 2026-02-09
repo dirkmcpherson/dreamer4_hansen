@@ -35,6 +35,49 @@ except ImportError:
     from dreamer4.train_tokenizer import log_tokenizer_viz_wandb
     from dreamer4.viz_utils import save_tokenizer_viz
 
+def tstats(name, x):
+    if x is None:
+        print(f"{name}: None")
+        return
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
+    if not torch.is_tensor(x):
+        print(f"{name}: type={type(x)}")
+        return
+    xd = x.detach()
+    finite = torch.isfinite(xd)
+    fin_ratio = finite.float().mean().item()
+    if fin_ratio < 1.0:
+        xd = xd[finite]
+    if xd.numel() == 0:
+        print(f"{name}: all non-finite")
+        return
+    print(
+        f"{name}: shape={tuple(x.shape)} dtype={x.dtype} dev={x.device} "
+        f"min={xd.min().item():+.4f} max={xd.max().item():+.4f} "
+        f"mean={xd.mean().item():+.4f} std={xd.std(unbiased=False).item():+.4f} "
+        f"finite={fin_ratio*100:.1f}%"
+    )
+
+
+if step % 200 == 0:
+    print("\n=== BATCH SANITY ===")
+    tstats("frames", frames)
+    tstats("actions_raw", actions)
+    tstats("rewards_raw", rewards)
+    tstats("act_mask", act_mask)
+
+    # Quick guess: are actions pixels [0,512] or normalized [-1,1]?
+    a_min = actions.detach().min().item()
+    a_max = actions.detach().max().item()
+    if a_min >= 0.0 and a_max > 2.0:
+        print("NOTE: actions look UNNORMALIZED (likely pixel coords). Consider normalizing to [-1,1].")
+    elif a_min >= -1.2 and a_max <= 1.2:
+        print("NOTE: actions look normalized to ~[-1,1].")
+    else:
+        print("NOTE: actions have unusual range; verify ActionEncoder expectation.")
+
+
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -99,6 +142,9 @@ def main():
     if not os.path.exists(args.ckpt_dir):
         os.makedirs(args.ckpt_dir, exist_ok=True)
     
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     save_path = os.path.join(args.ckpt_dir, "tok_latest.pt")
     if os.path.exists(save_path) and not args.force_retrain:
         print(f"Found existing checkpoint at {save_path}. Skipping training (use --force_retrain to override).")
@@ -117,8 +163,6 @@ def main():
         
         print("Generating visualization batch (model.train() + p=0)...")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
     
     seed_everything(random.randint(0, 10000))
 
@@ -142,21 +186,68 @@ def main():
         print(f"Current working dir: {os.getcwd()}")
         # We will try to proceed but likely fail if no data
     
-    dataset = ShardedFrameDataset(
-        outdirs=valid_dirs if valid_dirs else args.data_dirs,
+    # 1. Gather all shard paths first
+    all_shard_paths = []
+    for d in valid_dirs if valid_dirs else args.data_dirs:
+        root = Path(d)
+        for task in ["pusht"]:
+            task_dir = root / task
+            if not task_dir.exists():
+                continue
+            for fname in sorted(os.listdir(task_dir)):
+                if fname.endswith(".pt"):
+                    all_shard_paths.append(str(task_dir / fname))
+    
+    all_shard_paths = sorted(all_shard_paths)
+    print(f"Found {len(all_shard_paths)} total shards.")
+
+    # 2. Split into train and val (hold back last 10)
+    val_count = 10
+    if len(all_shard_paths) <= val_count:
+        print("Warning: not enough shards to hold back 10 for validation. Using all for training.")
+        train_paths = all_shard_paths
+        val_paths = []
+    else:
+        train_paths = all_shard_paths[:-val_count]
+        val_paths = all_shard_paths[-val_count:]
+    
+    print(f"Train shards: {len(train_paths)}")
+    print(f"Val shards:   {len(val_paths)}")
+
+    # 3. Create datasets
+    train_dataset = ShardedFrameDataset(
+        outdirs=valid_dirs if valid_dirs else args.data_dirs, # ignored if shard_paths present
         tasks=["pusht"],
         seq_len=8,
         iid_sampling=True,
+        shard_paths=train_paths
     )
+    
+    val_dataset = None
+    val_dataloader = None
+    if val_paths:
+        val_dataset = ShardedFrameDataset(
+            outdirs=valid_dirs if valid_dirs else args.data_dirs,
+            tasks=["pusht"],
+            seq_len=8,
+            iid_sampling=True,
+            shard_paths=val_paths
+        )
+        val_dataloader = DataLoader(
+             val_dataset,
+             batch_size=args.batch_size,
+             shuffle=True, # Random sampling for validation too
+             num_workers=args.num_workers,
+             pin_memory=True,
+             drop_last=True
+        )
 
     # Log data source breakdown
     source_counts = Counter()
     total_frames = 0
     print("-" * 40)
-    print("Data Source Breakdown:")
-    for shard in dataset.shards:
-        # path is .../root/task/shard.pt
-        # We identify source by the root directory name (parent of task)
+    print("Data Source Breakdown (Train):")
+    for shard in train_dataset.shards:
         path = Path(shard['path'])
         source = path.parent.parent.name
         source_counts[source] += shard['num_frames']
@@ -169,7 +260,7 @@ def main():
     print("-" * 40)
     
     dataloader = DataLoader(
-        dataset, 
+        train_dataset, 
         batch_size=args.batch_size, 
         shuffle=True, 
         num_workers=args.num_workers,
@@ -371,6 +462,81 @@ def main():
             if step % args.print_every == 0:
                 psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-10))
                 print(f"Step {step}: loss={loss.item():.4f} | mse={mse.item():.4f} | lpips={lp.item():.4f} | psnr={psnr.item():.2f}")
+
+            # Validation Loop
+            if step > 0 and step % args.viz_every == 0 and val_dataloader is not None:
+                print(f"Running validation at step {step}...")
+                model.eval()
+                val_mse_sum = 0.0
+                val_psnr_sum = 0.0
+                val_batches = 0
+                
+                # Run a few batches for validation (e.g. 10 or 20 to be quick)
+                max_val_batches = 20
+                
+                with torch.no_grad():
+                    for i, val_batch in enumerate(val_dataloader):
+                        if i >= max_val_batches:
+                            break
+                        
+                        vx = val_batch.to(device)
+                        if vx.dtype == torch.uint8:
+                            vx = vx.float() / 255.0
+                        
+                        vpatches = temporal_patchify(vx, patch)
+                        
+                        # Full reconstruction (no masking for validation metric?)
+                        # Or should we validate reconstruction capability WITH masking?
+                        # Usually we care about reconstruction capability. 
+                        # Let's test reconstruction WITHOUT masking (p=0) or WITH masking?
+                        # Training uses masking. Let's stick to the training task: mae reconstruction.
+                        
+                        with autocast(device_type="cuda", enabled=use_amp):
+                             vpred, vmask, _ = model(vpatches)
+                             vmse = recon_loss_from_mae(vpred, vpatches, vmask)
+                             vpsnr = 10.0 * torch.log10(1.0 / vmse.clamp_min(1e-10))
+                        
+                        val_mse_sum += vmse.item()
+                        val_psnr_sum += vpsnr.item()
+                        val_batches += 1
+                
+                model.train()
+                if val_batches > 0:
+                    val_mse = val_mse_sum / val_batches
+                    val_psnr = val_psnr_sum / val_batches
+                    print(f"Validation: mse={val_mse:.4f} | psnr={val_psnr:.2f}")
+                    
+                    if (args.monitor_activations or args.wandb_project) and not args.no_wandb:
+                        wandb.log({
+                            "val/mse": val_mse,
+                            "val/psnr": val_psnr
+                        }, step=step)
+                    
+                    # Save validation visualization (using last batch from loop)
+                    # vx is the last batch input, vpred is the last batch prediction
+                    print(f"Saving validation visualization at step {step}...")
+                    save_tokenizer_viz(
+                        x_btchw=vx,
+                        pred_btnd=vpred,
+                        mae_mask_btNp1=vmask,
+                        patch=patch,
+                        step=step,
+                        save_dir=os.path.join(args.ckpt_dir, "viz_val"),
+                        max_items=args.viz_max_items,
+                        max_T=args.viz_max_T
+                    )
+                    
+                    if (args.monitor_activations or args.wandb_project) and not args.no_wandb:
+                        log_tokenizer_viz_wandb(
+                            x_btchw=vx,
+                            pred_btnd=vpred,
+                            mae_mask_btNp1=vmask,
+                            patch=patch,
+                            step=step,
+                            max_items=args.viz_max_items,
+                            max_T=args.viz_max_T,
+                            caption_prefix="val"
+                        )
 
             if step % args.viz_every == 0 and step > 0:
                  if (args.monitor_activations or args.wandb_project) and not args.no_wandb:

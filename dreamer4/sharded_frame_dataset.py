@@ -28,6 +28,7 @@ class ShardedFrameDataset(Dataset):
         seq_len: int = 16,
         iid_sampling: bool = True,
         cache_size: int = 128,
+        shard_paths: Optional[Sequence[str]] = None,
     ):
         super().__init__()
         assert outdirs is not None, "outdirs must be specified"
@@ -49,17 +50,24 @@ class ShardedFrameDataset(Dataset):
         self.cum_starts: List[int] = []
         total_starts = 0
 
-        for root in self.outdirs:
-            root = Path(root)
-            for task in self.tasks:
-                task_dir = root / task
-                if not task_dir.exists():
-                    continue
-
-                for fname in sorted(os.listdir(task_dir)):
-                    if not fname.endswith(".pt"):
+        # If strict paths provided, use them. Otherwise scan folders.
+        if shard_paths is not None:
+             candidates = [Path(p) for p in shard_paths]
+        else:
+            candidates = []
+            for root in self.outdirs:
+                root = Path(root)
+                for task in self.tasks:
+                    task_dir = root / task
+                    if not task_dir.exists():
                         continue
-                    path = task_dir / fname
+                    for fname in sorted(os.listdir(task_dir)):
+                        if not fname.endswith(".pt"):
+                            continue
+                        candidates.append(task_dir / fname)
+
+        for path in candidates:
+
 
                     try:
                         td = torch.load(path, map_location="cpu")

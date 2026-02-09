@@ -602,6 +602,7 @@ class Dynamics(nn.Module):
         nn.init.normal_(self.register_tokens, std=0.02)
 
         self.action_encoder = ActionEncoder(d_model=self.d_model, action_dim=action_dim)
+        self.action_scale = 1.0  # start 10–30
 
         # shortcut conditioning
         self.num_step_bins = int(math.log2(self.k_max)) + 1
@@ -641,11 +642,11 @@ class Dynamics(nn.Module):
         nn.init.zeros_(self.flow_x_head.weight)
         nn.init.zeros_(self.flow_x_head.bias)
 
-        self.reward_head = nn.Sequential(
-            nn.Linear(self.d_model, 256),
-            nn.SiLU(),
-            nn.Linear(256, 1) # scalar reward
-        )
+        # self.reward_head = nn.Sequential(
+        #     nn.Linear(self.d_model, 256),
+        #     nn.SiLU(),
+        #     nn.Linear(256, 1) # scalar reward
+        # )
 
     def forward(
         self,
@@ -667,6 +668,8 @@ class Dynamics(nn.Module):
             act_mask=act_mask,
             as_tokens=True,
         )  # (B,T,1,d_model)
+
+        action_tokens = action_tokens * self.action_scale # JS, make them louder
 
         reg = self.register_tokens.view(1, 1, self.n_register, self.d_model).expand(B, T, -1, -1)
 
@@ -691,17 +694,10 @@ class Dynamics(nn.Module):
         if self.n_agent > 0:
             h_t = x[:, :, self.agent_slice, :]   # (B,T,n_agent,d_model)
 
-        # Reward prediction from spatial or agent tokens?
-        # Typically Dreamer uses the recurrent states. Here 'x' is the tokens after transformer.
-        # Let's pool spatial tokens or use specific tokens.
-        # Using mean of spatial tokens for now as a simple aggregate state representation.
-        # Alternatively, could use agent tokens if they exist.
-        
-        # Taking mean of spatial_out
-        state_rep = spatial_out.mean(dim=2) # (B,T,d_model)
-        reward_hat = self.reward_head(state_rep).squeeze(-1) # (B,T)
+        # Reward prediction removed
+        # reward_hat = self.reward_head(state_rep).squeeze(-1) # (B,T)
 
-        return x1_hat, h_t, reward_hat
+        return x1_hat, h_t, None
 
 
 def recon_loss_from_mae(pred_btnd: torch.Tensor,
