@@ -35,48 +35,6 @@ except ImportError:
     from dreamer4.train_tokenizer import log_tokenizer_viz_wandb
     from dreamer4.viz_utils import save_tokenizer_viz
 
-def tstats(name, x):
-    if x is None:
-        print(f"{name}: None")
-        return
-    if isinstance(x, np.ndarray):
-        x = torch.from_numpy(x)
-    if not torch.is_tensor(x):
-        print(f"{name}: type={type(x)}")
-        return
-    xd = x.detach()
-    finite = torch.isfinite(xd)
-    fin_ratio = finite.float().mean().item()
-    if fin_ratio < 1.0:
-        xd = xd[finite]
-    if xd.numel() == 0:
-        print(f"{name}: all non-finite")
-        return
-    print(
-        f"{name}: shape={tuple(x.shape)} dtype={x.dtype} dev={x.device} "
-        f"min={xd.min().item():+.4f} max={xd.max().item():+.4f} "
-        f"mean={xd.mean().item():+.4f} std={xd.std(unbiased=False).item():+.4f} "
-        f"finite={fin_ratio*100:.1f}%"
-    )
-
-
-if step % 200 == 0:
-    print("\n=== BATCH SANITY ===")
-    tstats("frames", frames)
-    tstats("actions_raw", actions)
-    tstats("rewards_raw", rewards)
-    tstats("act_mask", act_mask)
-
-    # Quick guess: are actions pixels [0,512] or normalized [-1,1]?
-    a_min = actions.detach().min().item()
-    a_max = actions.detach().max().item()
-    if a_min >= 0.0 and a_max > 2.0:
-        print("NOTE: actions look UNNORMALIZED (likely pixel coords). Consider normalizing to [-1,1].")
-    elif a_min >= -1.2 and a_max <= 1.2:
-        print("NOTE: actions look normalized to ~[-1,1].")
-    else:
-        print("NOTE: actions have unusual range; verify ActionEncoder expectation.")
-
 
 def seed_everything(seed: int):
     random.seed(seed)
@@ -92,7 +50,7 @@ def main():
     default_pusht_train = os.path.join(script_dir, "./data/pusht_train")
     default_pusht_play = os.path.join(script_dir, "./data/pusht_play")
     parser.add_argument("--data_dirs", type=str, nargs="+", default=[default_pusht_train, default_pusht_play])
-    parser.add_argument("--max_steps", type=int, default=300001)
+    parser.add_argument("--max_steps", type=int, default=200001)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--ckpt_dir", type=str, default=".")
     

@@ -237,8 +237,9 @@ def main():
     default_data_dir = os.path.join(os.path.dirname(__file__), "../data/pusht_train")
     parser.add_argument("--data_dirs", type=str, nargs="+", default=[default_data_dir])
     parser.add_argument("--tokenizer_ckpt", type=str, default="tok_latest.pt")
-    parser.add_argument("--max_steps", type=int, default=200000)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--seq_len", type=int, default=16)
+    parser.add_argument("--max_steps", type=int, default=1000000)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--ckpt_dir", type=str, default=".")
     parser.add_argument("--verbose", action="store_true")
     
@@ -275,19 +276,20 @@ def main():
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true")
 
-    parser.add_argument("--log_every", type=int, default=100)
-    parser.add_argument("--monitor_every", type=int, default=1000) # Re-added for viz
+    parser.add_argument("--log_every", type=int, default=1000)
+    parser.add_argument("--monitor_every", type=int, default=10000) # Re-added for viz
     parser.add_argument("--monitor_activations", action="store_true")
     parser.add_argument("--compile", action="store_true")
     
     # Eval / Viz
-    parser.add_argument("--eval_every", type=int, default=1000)
+    parser.add_argument("--eval_every", type=int, default=50000)
     parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument("--eval_max_items", type=int, default=4)
     parser.add_argument("--eval_ctx", type=int, default=4)
     parser.add_argument("--eval_horizon", type=int, default=12)
     parser.add_argument("--eval_schedule", type=str, default="finest", choices=["finest", "shortcut"])
     parser.add_argument("--eval_d", type=float, default=0.25)
+    parser.add_argument("--eval_mask_ratio", type=float, default=0.3)
 
     args = parser.parse_args()
 
@@ -369,7 +371,7 @@ def main():
     valid_dirs = [d for d in args.data_dirs if os.path.exists(d)]
     dataset = PushTShardedDataset(
         outdirs=valid_dirs if valid_dirs else args.data_dirs,
-        seq_len=16
+        seq_len=args.seq_len
     )
     
     dataloader = DataLoader(
@@ -583,41 +585,18 @@ def main():
 
 
 
-            # --- DEBUG: flip this to compare alignment ---
-            DEBUG_SHIFT_ACTIONS = False   # set False to test "no shift"
-            DEBUG_SHIFT_REWARDS = False
-
-            if DEBUG_SHIFT_ACTIONS:
-                actions_shifted = torch.zeros_like(actions)
-                actions_shifted[:, 1:] = actions[:, :-1]
-                actions_raw = actions
-                actions = actions_shifted
-
-            if DEBUG_SHIFT_REWARDS:
-                rewards_shifted = torch.zeros_like(rewards)
-                rewards_shifted[:, 1:] = rewards[:, :-1]
-                rewards_raw = rewards
-                rewards = rewards_shifted
-
-            # if step % 200 == 0:
-            #     print("\n=== AFTER SHIFT ===")
-            #     tstats("actions_used", actions)
-            #     tstats("rewards_used", rewards)
-
-
             # Causal Shift:
             # frames[t] is s_t.
-            # a[t] is action taken at s_t (leads to s_{t+1}).
-            # Model at step t (predicting z_t) should see a_{t-1}.
-            # So we shift actions right by 1.
-            # actions_shifted = torch.zeros_like(actions)
-            # actions_shifted[:, 1:] = actions[:, :-1]
-            # actions = actions_shifted
+            # act[t] is action taken at s_t (leads to s_{t+1}).
+            # Model at step t (predicting s_t) should see a_{t-1}.
+            # So we shift actions right by 1, and same for rewards.
+            actions_shifted = torch.zeros_like(actions)
+            actions_shifted[:, 1:] = actions[:, :-1]
+            actions = actions_shifted
             
-            # # Same for rewards: r_{t-1} is reward received arriving at s_t (or from s_{t-1}, a_{t-1})
-            # rewards_shifted = torch.zeros_like(rewards)
-            # rewards_shifted[:, 1:] = rewards[:, :-1]
-            # rewards = rewards_shifted
+            rewards_shifted = torch.zeros_like(rewards)
+            rewards_shifted[:, 1:] = rewards[:, :-1]
+            rewards = rewards_shifted
 
             # Encode with frozen tokenizer
             with torch.no_grad():
@@ -844,7 +823,8 @@ def main():
                     horizon=args.eval_horizon,
                     sched=sched,
                     max_items=args.eval_max_items,
-                    step=step
+                    step=step,
+                    eval_mask_ratio=args.eval_mask_ratio
                 )
 
             # Checkpointing

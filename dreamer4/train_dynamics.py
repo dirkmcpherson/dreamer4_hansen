@@ -32,6 +32,13 @@ from .model import (
     Dynamics,
 )
 
+def set_mae_p(model, p):
+    for m in model.modules():
+        if hasattr(m, 'p_min') and hasattr(m, 'p_max') and not isinstance(m, Encoder):
+            m.p_min = float(p)
+            m.p_max = float(p)
+
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -547,6 +554,7 @@ def run_dynamics_eval(
     sched: Dict[str, Any],
     max_items: int,
     step: int,
+    eval_mask_ratio: float = 0.0,
 ):
     dyn_was_training = dyn.training
     dyn.eval()
@@ -559,7 +567,16 @@ def run_dynamics_eval(
     frames_eval = frames[:, :T_eval]
 
     patches = temporal_patchify(frames_eval, patch)
+    
+    # Optional: Apply masking during encoding for better decoder performance
+    if eval_mask_ratio > 0:
+        set_mae_p(encoder, eval_mask_ratio)
+    
     z_btLd, _ = encoder(patches)  # (B,T_eval,L,D_b)
+    
+    if eval_mask_ratio > 0:
+        set_mae_p(encoder, 0.0)
+        
     assert z_btLd.shape[2] % packing_factor == 0
     n_spatial = z_btLd.shape[2] // packing_factor
     z_gt_packed = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=packing_factor)  # (B,T_eval,Sz,Dz)
@@ -932,6 +949,7 @@ def train(args):
                         sched=sched,
                         max_items=args.eval_max_items,
                         step=step,
+                        eval_mask_ratio=args.eval_mask_ratio,
                     )
 
                 # Logging
@@ -1069,8 +1087,9 @@ if __name__ == "__main__":
     p.add_argument("--eval_max_items", type=int, default=4)
     p.add_argument("--eval_ctx", type=int, default=4)
     p.add_argument("--eval_horizon", type=int, default=12)
-    p.add_argument("--eval_schedule", type=str, default="shortcut", choices=["finest", "shortcut"])
+    p.add_argument("--eval_schedule", type=str, default="finest", choices=["finest", "shortcut"])
     p.add_argument("--eval_d", type=float, default=0.25)
+    p.add_argument("--eval_mask_ratio", type=float, default=0.0)
 
     # logging
     p.add_argument("--log_every", type=int, default=100)
