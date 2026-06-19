@@ -159,7 +159,7 @@ def train(args):
     # ---- data ----
     dataset = ShardedFrameDataset(
         outdirs=args.data_dirs,
-        tasks=TASK_SET,
+        tasks=args.tasks,
         seq_len=args.seq_len,
         iid_sampling=True,
     )
@@ -381,6 +381,8 @@ if __name__ == "__main__":
         "/<path>/mixed-small-shards",
         "/<path>/mixed-large-shards",
     ])
+    p.add_argument("--tasks", type=str, nargs="+", default=TASK_SET,
+                   help="which task subfolders to train on (default: full DMControl TASK_SET)")
     p.add_argument("--seq_len", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=8)

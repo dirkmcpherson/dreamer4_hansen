@@ -584,6 +584,7 @@ class Dynamics(nn.Module):
         mlp_ratio: float = 4.0,
         time_every: int = 4,
         space_mode: str = "wm_agent_isolated",  # or "wm_agent"
+        action_dim: int = 16,
     ):
         super().__init__()
         assert d_spatial % d_bottleneck == 0, "expected packing: d_spatial = d_bottleneck * packing_factor"
@@ -598,7 +599,7 @@ class Dynamics(nn.Module):
         self.register_tokens = nn.Parameter(torch.empty(self.n_register, self.d_model))
         nn.init.normal_(self.register_tokens, std=0.02)
 
-        self.action_encoder = ActionEncoder(d_model=self.d_model, action_dim=16)
+        self.action_encoder = ActionEncoder(d_model=self.d_model, action_dim=int(action_dim))
 
         # shortcut conditioning
         self.num_step_bins = int(math.log2(self.k_max)) + 1

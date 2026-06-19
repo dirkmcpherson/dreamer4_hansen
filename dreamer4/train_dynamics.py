@@ -108,6 +108,16 @@ def load_frozen_tokenizer_from_pt_ckpt(
     n_patches = (H // patch) * (W // patch)
     d_patch = patch * patch * C
 
+    # Depth may be absent/None in older checkpoint args; infer it from the
+    # saved weights (count transformer layers) so we build a matching model.
+    depth_arg = tok_args.get("depth", None)
+    if depth_arg is None:
+        layer_ids = [
+            int(k.split("encoder.transformer.layers.")[1].split(".")[0])
+            for k in ckpt["model"] if "encoder.transformer.layers." in k
+        ]
+        tok_args["depth"] = (max(layer_ids) + 1) if layer_ids else 8
+
     enc = Encoder(
         patch_dim=d_patch,
         d_model=int(tok_args.get("d_model", 256)),
@@ -589,7 +599,7 @@ def train(args):
             img_size=128,
             action_dim=16,
             tasks_json=args.tasks_json,
-            tasks=TASK_SET,
+            tasks=args.tasks,
             verbose=is_rank0(),
         )
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -608,7 +618,7 @@ def train(args):
     else:
         dataset = ShardedFrameDataset(
             outdirs=args.frame_dirs,
-            tasks=TASK_SET,
+            tasks=args.tasks,
             seq_len=args.seq_len,
         )
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -910,6 +920,8 @@ if __name__ == "__main__":
         "/<path>/mixed-large-shards",
     ])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
+    p.add_argument("--tasks", type=str, nargs="+", default=TASK_SET,
+                   help="which tasks to train on (default: full DMControl TASK_SET)")
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=24)
