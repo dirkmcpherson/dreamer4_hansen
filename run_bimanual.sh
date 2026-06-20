@@ -20,13 +20,17 @@ export DATA="${DATA:-$REPO/data/iws_mujoco}"          # raw HDF5 download
 export OUT="${OUT:-$REPO/data/bimanual_pusht}"        # converted shards
 export PYTHONPATH="$REPO/dreamer4${PYTHONPATH:+:$PYTHONPATH}"   # sibling `import task_set`
 export WANDB_MODE="${WANDB_MODE:-online}"             # set to "offline" if no network
+# 128^2 tokenizer uses MASKED space-attention over 1024 patches, which forces
+# SDPA off the flash path and materializes the full NxN scores -> memory scales
+# hard with batch size. Keep batches modest even on a 140GB H200.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 PY="${PY:-python}"
 TOK_DIR="$REPO/logs/bimanual/tok"
 DYN_DIR="$REPO/logs/bimanual/dyn"
 
-# H200-ish defaults; lower if you OOM
-TOK_BS="${TOK_BS:-96}"
-DYN_BS="${DYN_BS:-48}"
+# Conservative defaults that fit ~140GB at 128^2; raise gradually watching nvidia-smi.
+TOK_BS="${TOK_BS:-16}"
+DYN_BS="${DYN_BS:-8}"
 TOK_STEPS="${TOK_STEPS:-100000}"
 DYN_STEPS="${DYN_STEPS:-300000}"
 
