@@ -200,6 +200,7 @@ def train(args):
         mae_p_min=args.mae_p_min,
         mae_p_max=args.mae_p_max,
         scale_pos_embeds=args.scale_pos_embeds,
+        grad_checkpoint=args.grad_checkpoint,
     )
     dec = Decoder(
         d_bottleneck=args.d_bottleneck,
@@ -213,6 +214,7 @@ def train(args):
         mlp_ratio=args.mlp_ratio,
         time_every=args.time_every,
         scale_pos_embeds=args.scale_pos_embeds,
+        grad_checkpoint=args.grad_checkpoint,
     )
     model = Tokenizer(enc, dec).to(device)
 
@@ -443,5 +445,8 @@ if __name__ == "__main__":
     # misc
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--grad_checkpoint", action="store_true",
+                   help="recompute transformer blocks in backward to cut activation memory "
+                        "(exact, ~25-33%% slower/step; lets you use bigger batches)")
 
     train(p.parse_args())

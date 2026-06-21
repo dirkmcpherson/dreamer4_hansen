@@ -676,6 +676,7 @@ def train(args):
         time_every=args.time_every,
         space_mode=args.space_mode,
         scale_pos_embeds=args.scale_pos_embeds,
+        grad_checkpoint=args.grad_checkpoint,
     ).to(device)
 
     if is_rank0():
@@ -994,5 +995,8 @@ if __name__ == "__main__":
     # misc
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--grad_checkpoint", action="store_true",
+                   help="recompute transformer blocks in backward to cut activation memory "
+                        "(exact, ~25-33%% slower/step; lets you use bigger batches)")
 
     train(p.parse_args())

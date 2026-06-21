@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class Modality(IntEnum):
@@ -335,8 +336,10 @@ class BlockCausalTransformer(nn.Module):
         mlp_ratio: float,
         time_every: int,
         latents_only_time: bool,
+        grad_checkpoint: bool = False,
     ):
         super().__init__()
+        self.grad_checkpoint = bool(grad_checkpoint)
         self.layers = nn.ModuleList([
             BlockCausalLayer(
                 d_model=d_model, n_heads=n_heads, n_latents=n_latents,
@@ -350,7 +353,13 @@ class BlockCausalTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x)
+            if self.grad_checkpoint and self.training:
+                # Recompute each block in backward instead of retaining the
+                # (S,S) masked-attention scores. Exactly equivalent math;
+                # preserve_rng_state (default) keeps dropout masks identical.
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         return x
 
 
@@ -372,6 +381,7 @@ class Encoder(nn.Module):
         mae_p_min: float = 0.0,
         mae_p_max: float = 0.9,
         scale_pos_embeds: bool = True,
+        grad_checkpoint: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -391,6 +401,7 @@ class Encoder(nn.Module):
             space_mode="encoder",
             dropout=dropout, mlp_ratio=mlp_ratio,
             time_every=time_every, latents_only_time=latents_only_time,
+            grad_checkpoint=grad_checkpoint,
         )
         self.mae = MAEReplacer(d_model=d_model, p_min=mae_p_min, p_max=mae_p_max)
 
@@ -429,6 +440,7 @@ class Decoder(nn.Module):
         time_every: int = 4,
         latents_only_time: bool = True,
         scale_pos_embeds: bool = True,
+        grad_checkpoint: bool = False,
     ):
         super().__init__()
         self.n_latents = n_latents
@@ -450,6 +462,7 @@ class Decoder(nn.Module):
             space_mode="decoder",
             dropout=dropout, mlp_ratio=mlp_ratio,
             time_every=time_every, latents_only_time=latents_only_time,
+            grad_checkpoint=grad_checkpoint,
         )
 
     def forward(self, z_btLd: torch.Tensor) -> torch.Tensor:
@@ -593,6 +606,7 @@ class Dynamics(nn.Module):
         space_mode: str = "wm_agent_isolated",  # or "wm_agent"
         action_dim: int = 16,
         scale_pos_embeds: bool = True,
+        grad_checkpoint: bool = False,
     ):
         super().__init__()
         assert d_spatial % d_bottleneck == 0, "expected packing: d_spatial = d_bottleneck * packing_factor"
@@ -642,6 +656,7 @@ class Dynamics(nn.Module):
             mlp_ratio=float(mlp_ratio),
             time_every=int(time_every),
             latents_only_time=False,
+            grad_checkpoint=grad_checkpoint,
         )
 
         self.flow_x_head = nn.Linear(self.d_model, self.d_spatial)

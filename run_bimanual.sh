@@ -31,6 +31,12 @@ DYN_DIR="$REPO/logs/bimanual/dyn"
 # Conservative defaults that fit ~140GB at 128^2; raise gradually watching nvidia-smi.
 TOK_BS="${TOK_BS:-16}"
 DYN_BS="${DYN_BS:-8}"
+
+# Optional: gradient checkpointing trades ~25-33% compute/step for a large drop in
+# activation memory (exact same math + dropout). Off by default; flip on to run a
+# much bigger batch, e.g.  GRAD_CKPT=1 TOK_BS=64 ./run_bimanual.sh tok
+GRAD_CKPT="${GRAD_CKPT:-0}"
+GC_FLAG=""; [ "$GRAD_CKPT" = "1" ] && GC_FLAG="--grad_checkpoint"
 TOK_STEPS="${TOK_STEPS:-100000}"
 DYN_STEPS="${DYN_STEPS:-300000}"
 
@@ -58,7 +64,7 @@ if has tok; then
   $PY -m dreamer4.train_tokenizer \
     --data_dirs "$OUT/train" --tasks pusht \
     --H 128 --W 128 --patch 4 \
-    --batch_size "$TOK_BS" --num_workers 8 \
+    --batch_size "$TOK_BS" --num_workers 8 $GC_FLAG \
     --max_steps "$TOK_STEPS" --save_every 5000 --log_every 100 \
     --lpips_weight 0.2 \
     --ckpt_dir "$TOK_DIR" \
@@ -73,7 +79,7 @@ if has dyn; then
     --data_dirs "$OUT/train" --frame_dirs "$OUT/train" \
     --tasks pusht --tasks_json "$REPO/tasks.json" \
     --tokenizer_ckpt "$TOK_DIR/latest.pt" \
-    --batch_size "$DYN_BS" --num_workers 8 --seq_len 32 \
+    --batch_size "$DYN_BS" --num_workers 8 --seq_len 32 $GC_FLAG \
     --max_steps "$DYN_STEPS" --save_every 10000 \
     --ckpt_dir "$DYN_DIR" \
     --wandb_project dreamer4-bimanual --wandb_run_name dynamics
