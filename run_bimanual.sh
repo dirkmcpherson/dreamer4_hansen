@@ -28,8 +28,15 @@ PY="${PY:-python}"
 TOK_DIR="$REPO/logs/bimanual/tok"
 DYN_DIR="$REPO/logs/bimanual/dyn"
 
+# Sequence length shared by BOTH stages. The tokenizer has causal time-attention + time
+# pos-embeds, so the dynamics encoder must run it at the SAME length it was trained on,
+# else frames past the tokenizer's trained horizon are out-of-distribution. Keep them equal.
+SEQ_LEN="${SEQ_LEN:-32}"
+
 # Conservative defaults that fit ~140GB at 128^2; raise gradually watching nvidia-smi.
-TOK_BS="${TOK_BS:-16}"
+# Tokenizer space-attention memory scales with batch*seq_len, so at SEQ_LEN=32 the batch
+# must be ~4x smaller than the old SEQ_LEN=8 runs (16 -> 4). Use GRAD_CKPT=1 to go bigger.
+TOK_BS="${TOK_BS:-4}"
 DYN_BS="${DYN_BS:-8}"
 
 # Optional: gradient checkpointing trades ~25-33% compute/step for a large drop in
@@ -63,7 +70,7 @@ if has tok; then
   gate "$OUT/train/pusht.pt"
   $PY -m dreamer4.train_tokenizer \
     --data_dirs "$OUT/train" --tasks pusht \
-    --H 128 --W 128 --patch 4 \
+    --H 128 --W 128 --patch 4 --seq_len "$SEQ_LEN" \
     --batch_size "$TOK_BS" --num_workers 8 $GC_FLAG \
     --max_steps "$TOK_STEPS" --save_every 5000 --log_every 100 \
     --lpips_weight 0.2 \
@@ -79,7 +86,7 @@ if has dyn; then
     --data_dirs "$OUT/train" --frame_dirs "$OUT/train" \
     --tasks pusht --tasks_json "$REPO/tasks.json" \
     --tokenizer_ckpt "$TOK_DIR/latest.pt" \
-    --batch_size "$DYN_BS" --num_workers 8 --seq_len 32 $GC_FLAG \
+    --batch_size "$DYN_BS" --num_workers 8 --seq_len "$SEQ_LEN" $GC_FLAG \
     --max_steps "$DYN_STEPS" --save_every 10000 \
     --ckpt_dir "$DYN_DIR" \
     --wandb_project dreamer4-bimanual --wandb_run_name dynamics

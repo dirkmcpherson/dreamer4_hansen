@@ -177,6 +177,7 @@ def train(args):
         drop_last=True,
         persistent_workers=(args.num_workers > 0),
         worker_init_fn=worker_init_fn,
+        timeout=(args.loader_timeout if args.num_workers > 0 else 0),
     )
 
     # ---- model ----
@@ -251,7 +252,7 @@ def train(args):
             project=args.wandb_project,
             name=args.wandb_run_name,
             entity=args.wandb_entity,
-            mode="online",
+            mode=os.environ.get("WANDB_MODE", "online"),
             config=vars(args),
         )
 
@@ -391,6 +392,9 @@ if __name__ == "__main__":
     p.add_argument("--seq_len", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--loader_timeout", type=int, default=600,
+                   help="seconds; if a DataLoader batch takes longer the loader RAISES instead "
+                        "of hanging forever (0=disabled). Guards against stalled/spun workers.")
 
     # image / patching
     p.add_argument("--H", type=int, default=128)

@@ -128,6 +128,7 @@ class WMDataset(Dataset):
         self.demo_paths = []     # kept for compatibility/debug; now stores list of per-task demo paths (joined)
         self.shard_lists = []    # NOW: per task -> list[segments], each segment is list[shard_paths]
         self.seg_cum_frames = [] # per task -> cumulative frame counts across segments (for indexing)
+        self.seg_shard_cums = [] # per task -> per segment -> cumulative per-shard frame counts (variable-size shards)
 
         self.ep = []
         self.act = []
@@ -148,6 +149,7 @@ class WMDataset(Dataset):
             seg_acts = []
             seg_rews = []
             seg_shards = []
+            seg_shard_cums = []
             seg_num_frames = []
             seg_demo_paths = []
 
@@ -191,17 +193,27 @@ class WMDataset(Dataset):
                         print(f"[WMDataset] Skipping task={task} source=({dd},{fd}): length mismatch ep/act/rew.")
                     continue
 
-                # Determine frames available in this source segment (load only last shard)
-                try:
-                    last = torch.load(shards[-1], map_location="cpu", weights_only=False)
-                    frames_last = last["frames"]
-                    last_len = int(frames_last.shape[0])
-                except Exception as e:
-                    if self.verbose:
-                        print(f"[WMDataset] Skipping task={task} source=({dd},{fd}): torch.load last shard failed: {e}")
-                    continue
+                # Per-shard frame counts. The IWS converter writes ONE shard per episode
+                # (variable length), so we must NOT assume a fixed shard_size. Derive lengths
+                # from the episode index when shard/episode counts match (fast, no extra file
+                # I/O); otherwise fall back to reading each shard's frame count directly.
+                _, ep_counts = torch.unique_consecutive(ep, return_counts=True)
+                if len(ep_counts) == len(shards):
+                    shard_lens = [int(c) for c in ep_counts.tolist()]
+                else:
+                    try:
+                        shard_lens = [self._shard_num_frames(s) for s in shards]
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"[WMDataset] Skipping task={task} source=({dd},{fd}): reading shard lengths failed: {e}")
+                        continue
 
-                N_frames_avail = (len(shards) - 1) * self.shard_size + last_len
+                shard_cum, acc = [], 0
+                for nfr in shard_lens:
+                    acc += int(nfr)
+                    shard_cum.append(acc)
+
+                N_frames_avail = acc
                 N_eff = min(N, N_frames_avail)
                 if N_eff < (self.T + 1):
                     if self.verbose:
@@ -224,6 +236,7 @@ class WMDataset(Dataset):
                 seg_acts.append(act)
                 seg_rews.append(rew)
                 seg_shards.append(shards)
+                seg_shard_cums.append(shard_cum)
                 seg_num_frames.append(int(N_eff))
                 seg_demo_paths.append(dp)
 
@@ -303,6 +316,7 @@ class WMDataset(Dataset):
 
             # NEW: per-task segments of shard lists + cumulative frame counts
             self.shard_lists.append(seg_shards)
+            self.seg_shard_cums.append(seg_shard_cums)
             cum = []
             s = 0
             for nf in seg_num_frames:
@@ -366,6 +380,14 @@ class WMDataset(Dataset):
         self._cache[key] = tensor
         self._cache_nbytes += nbytes
 
+    def _shard_num_frames(self, path: str) -> int:
+        """Frame count of a shard, read cheaply (mmap = metadata only, no full load)."""
+        try:
+            td = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+        except (TypeError, RuntimeError):
+            td = torch.load(path, map_location="cpu", weights_only=False)
+        return int(td["frames"].shape[0])
+
     # --- CHANGED: add seg_idx to shard cache/load ---
     def _load_shard_frames(self, task_idx: int, seg_idx: int, shard_idx: int) -> torch.Tensor:
         key = (task_idx, seg_idx, shard_idx)
@@ -410,8 +432,11 @@ class WMDataset(Dataset):
             seg_end = seg_cum[seg_idx]
             local_idx = idx - prev_cum
 
-            shard_idx = local_idx // self.shard_size
-            off = local_idx % self.shard_size
+            # variable-size shards: locate the shard holding local_idx via its cumulative table
+            shard_cum = self.seg_shard_cums[task_idx][seg_idx]
+            shard_idx = bisect.bisect_right(shard_cum, local_idx)
+            shard_start = 0 if shard_idx == 0 else shard_cum[shard_idx - 1]
+            off = local_idx - shard_start
 
             frames = self._load_shard_frames(task_idx, seg_idx, shard_idx)
 
