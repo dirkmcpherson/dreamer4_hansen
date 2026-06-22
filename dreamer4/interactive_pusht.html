@@ -1,0 +1,195 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Dreamer4 PushT Interactive</title>
+  <style>
+    :root {
+      --bg: #23234b;
+      --fg: #e4e4ee;
+      --muted: rgba(228, 228, 238, 0.75);
+      --border: rgba(228, 228, 238, 0.25);
+      --panel: rgba(0, 0, 0, 0.18);
+      --kbd-bg: rgba(255, 255, 255, 0.08);
+      --btn-bg: rgba(255, 255, 255, 0.10);
+      --btn-bg-hover: rgba(255, 255, 255, 0.16);
+      --btn-border: rgba(228, 228, 238, 0.25);
+      --pause-overlay: rgba(0, 0, 0, 0.40);
+    }
+
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      overflow: hidden; /* Prevent scrolling */
+    }
+
+    .page {
+      min-height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+      box-sizing: border-box;
+    }
+
+    .main {
+      width: min(900px, 95vw);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      padding-bottom: 20px;
+      box-sizing: border-box;
+    }
+
+    .title {
+      font-weight: 700;
+      font-size: 30px;
+      text-align: center;
+      letter-spacing: 0.2px;
+      user-select: none;
+    }
+
+    .frameWrap {
+      position: relative;
+      width: 512px;
+      height: 512px;
+      max-width: 95vw;
+      max-height: 95vw;
+      cursor: crosshair; /* Indicate mouse interaction */
+    }
+
+    #frame {
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: rgba(0,0,0,0.08);
+      display: block;
+    }
+
+    .status {
+      font-size: 14px;
+      color: var(--fg);
+      text-align: center;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+      width: 512px;
+      max-width: 95vw;
+      box-sizing: border-box;
+      line-height: 1.35;
+      user-select: none;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 14px;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="page">
+    <div class="main">
+      <div class="title">PushT Imagination</div>
+
+      <div class="frameWrap" id="frameWrap">
+        <img id="frame" width="512" height="512" />
+      </div>
+
+      <div class="status" id="status">connecting…</div>
+      
+      <div class="hint">Move mouse over image to control (Pose). Click to Toggle Reset.</div>
+    </div>
+  </div>
+
+<script>
+(function() {
+  const statusEl = document.getElementById("status");
+  const imgEl = document.getElementById("frame");
+  const frameWrap = document.getElementById("frameWrap");
+
+  const proto = (location.protocol === "https:") ? "wss" : "ws";
+  const wsUrl = `${proto}://${location.host}/ws`;
+  let ws = null;
+  let lastUrl = null;
+
+  function send(obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(obj));
+  }
+
+  function connect() {
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => { statusEl.textContent = "connected"; };
+    ws.onclose = () => { statusEl.textContent = "disconnected"; };
+    ws.onerror = () => { statusEl.textContent = "error"; };
+
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === "string") {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "status") {
+            if (typeof msg.text === "string") statusEl.textContent = msg.text;
+          }
+        } catch(e) {}
+        return;
+      }
+
+      const blob = new Blob([ev.data], {type: "image/jpeg"});
+      const url = URL.createObjectURL(blob);
+      imgEl.onload = () => {
+        if (lastUrl) URL.revokeObjectURL(lastUrl);
+        lastUrl = url;
+      };
+      imgEl.src = url;
+    };
+  }
+
+  // Mouse handling
+  frameWrap.addEventListener("mousemove", (e) => {
+    const rect = frameWrap.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    
+    // Normalize to [-1, 1]
+    // 0 -> -1
+    // 512 -> 1
+    // val -> (val / 512) * 2 - 1
+    
+    // Clamp
+    const w = rect.width;
+    const h = rect.height;
+    
+    let nx = (x / w) * 2 - 1;
+    let ny = (y / h) * 2 - 1;
+    
+    // In PushT, y is down? Typically image Y is down.
+    // Let's assume standard image coords.
+    
+    nx = Math.max(-1, Math.min(1, nx));
+    ny = Math.max(-1, Math.min(1, ny));
+    
+    send({type: "mousemove", x: nx, y: ny});
+  });
+
+  frameWrap.addEventListener("mousedown", (e) => {
+      // Basic click to reset or toggle?
+      send({type: "reset"});
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

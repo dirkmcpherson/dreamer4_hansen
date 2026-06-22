@@ -422,6 +422,53 @@ def decode_packed_to_frames(
     return frames.clamp(0, 1)
 
 
+_VIDEO_WARNED = False
+
+
+@torch.no_grad()
+def pair_video_grid(gt_btchw, variants, *, max_items=4, gap_px=2):
+    """Build a video grid: one ROW per variant; within a row, each sample is shown as
+    [GT | variant] side by side, samples laid out across columns.
+
+    gt_btchw: (B,T,C,H,W) in [0,1]; variants: list of (B,T,C,H,W) (same shape).
+    Returns (T,C,Htot,Wtot) in [0,1] -- the time axis is the video's frame axis.
+    """
+    B, T, C, H, W = gt_btchw.shape
+    Bv = min(B, max_items)
+    dev, dt = gt_btchw.device, gt_btchw.dtype
+    vgap = torch.ones((T, C, H, gap_px), device=dev, dtype=dt)
+    rows = []
+    for var in variants:
+        cells = []
+        for i in range(Bv):
+            cells.append(torch.cat([gt_btchw[i], vgap, var[i]], dim=-1))  # (T,C,H,2W+gap)
+            if gap_px > 0 and i < Bv - 1:
+                cells.append(vgap)
+        rows.append(torch.cat(cells, dim=-1))  # (T,C,H,Wrow)
+    Wrow = rows[0].shape[-1]
+    hgap = torch.ones((T, C, gap_px, Wrow), device=dev, dtype=dt)
+    stacked = []
+    for j, r in enumerate(rows):
+        stacked.append(r)
+        if gap_px > 0 and j < len(rows) - 1:
+            stacked.append(hgap)
+    return torch.cat(stacked, dim=2).clamp(0, 1)  # (T,C,Htot,Wrow)
+
+
+@torch.no_grad()
+def log_video_grid(grid_tchw, *, step, tag, fps, caption):
+    """Log a (T,C,H,W) [0,1] grid as wandb.Video. Never raises (warns once on failure)."""
+    global _VIDEO_WARNED
+    try:
+        vid = (grid_tchw.clamp(0, 1) * 255.0).to(torch.uint8).cpu().numpy()  # (T,C,H,W)
+        wandb.log({tag: wandb.Video(vid, fps=int(fps), format="mp4", caption=caption)}, step=step)
+    except Exception as e:  # missing moviepy/ffmpeg, etc. -- don't kill training over a video
+        if not _VIDEO_WARNED:
+            print(f"[viz] wandb.Video logging disabled ({type(e).__name__}: {e}); "
+                  f"install with: pip install moviepy imageio-ffmpeg")
+            _VIDEO_WARNED = True
+
+
 @torch.no_grad()
 def log_dynamics_eval_wandb(
     *,
@@ -484,6 +531,9 @@ def run_dynamics_eval(
     sched: Dict[str, Any],
     max_items: int,
     step: int,
+    make_video: bool = False,
+    video_fps: int = 4,
+    action_noise_std: float = 0.1,
 ):
     dyn_was_training = dyn.training
     dyn.eval()
@@ -582,6 +632,35 @@ def run_dynamics_eval(
         max_items=max_items,
     )
 
+    # ---- monitoring video: GT | pred (data actions); plus an extra row driven by
+    #      lightly-noised actions to probe out-of-distribution action coverage ----
+    if make_video:
+        variants = [pred_frames]
+        cap = f"row1: GT | pred (data actions) | ctx={ctx_length} horizon={horizon}"
+        if actions_eval is not None and action_noise_std > 0.0:
+            noise = torch.randn_like(actions_eval) * action_noise_std
+            actions_noisy = (actions_eval + noise).clamp(-1.0, 1.0)
+            if act_mask_eval is not None and act_mask_eval.dim() == 3:
+                actions_noisy = actions_noisy * act_mask_eval  # keep padded dims zero
+            z_pred_noisy = sample_autoregressive_packed_sequence(
+                dyn,
+                z_gt_packed=z_gt_packed,
+                ctx_length=ctx_length,
+                horizon=horizon,
+                k_max=k_max,
+                sched=sched,
+                actions=actions_noisy,
+                act_mask=act_mask_eval,
+            )
+            pred_noisy_frames = decode_packed_to_frames(
+                decoder, z_packed=z_pred_noisy, H=H, W=W, C=C, patch=patch,
+                packing_factor=packing_factor,
+            )
+            variants.append(pred_noisy_frames)
+            cap += f"; row2: GT | pred (actions + N(0,{action_noise_std:.2f}))"
+        grid = pair_video_grid(frames_eval, variants, max_items=max_items)
+        log_video_grid(grid, step=step, tag="eval/video", fps=video_fps, caption=cap)
+
     if dyn_was_training:
         dyn.train()
 
@@ -617,6 +696,7 @@ def train(args):
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
             collate_fn=collate_batch,
+            timeout=(args.loader_timeout if args.num_workers > 0 else 0),
         )
     else:
         dataset = ShardedFrameDataset(
@@ -635,6 +715,7 @@ def train(args):
             drop_last=True,
             persistent_workers=(args.num_workers > 0),
             worker_init_fn=worker_init_fn,
+            timeout=(args.loader_timeout if args.num_workers > 0 else 0),
         )
 
     # Load frozen tokenizer
@@ -706,7 +787,7 @@ def train(args):
             project=args.wandb_project,
             name=args.wandb_run_name,
             entity=args.wandb_entity,
-            mode="online",
+            mode=os.environ.get("WANDB_MODE", "online"),
             config=vars(args),
         )
 
@@ -804,7 +885,9 @@ def train(args):
                     opt.zero_grad(set_to_none=True)
 
                 # Evaluation / visualization
-                if is_rank0() and args.eval_every > 0 and (step % args.eval_every == 0):
+                do_eval = args.eval_every > 0 and (step % args.eval_every == 0)
+                do_video = args.video_every > 0 and (step % args.video_every == 0)
+                if is_rank0() and (do_eval or do_video):
 
                     # Evaluate on a small slice of the current batch
                     B_eval = min(frames.shape[0], args.eval_batch_size)
@@ -834,6 +917,9 @@ def train(args):
                         sched=sched,
                         max_items=args.eval_max_items,
                         step=step,
+                        make_video=do_video,
+                        video_fps=args.video_fps,
+                        action_noise_std=args.action_noise_std,
                     )
 
                 # Logging
@@ -930,6 +1016,9 @@ if __name__ == "__main__":
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=24)
+    p.add_argument("--loader_timeout", type=int, default=600,
+                   help="seconds; if a DataLoader batch takes longer the loader RAISES instead of "
+                        "hanging forever (0=disabled). Guards against stalled/spun workers.")
 
     # tokenizer restore
     p.add_argument("--tokenizer_ckpt", type=str, default="./logs/tokenizer_ckpts/latest.pt")
@@ -978,6 +1067,13 @@ if __name__ == "__main__":
     p.add_argument("--eval_horizon", type=int, default=16)
     p.add_argument("--eval_schedule", type=str, default="shortcut", choices=["finest", "shortcut"])
     p.add_argument("--eval_d", type=float, default=0.25)
+
+    # monitoring video (logged to wandb as eval/video)
+    p.add_argument("--video_every", type=int, default=5_000,
+                   help="log a GT|pred rollout video every N steps (0=off). Best a multiple of eval_every.")
+    p.add_argument("--video_fps", type=int, default=4)
+    p.add_argument("--action_noise_std", type=float, default=0.1,
+                   help="std of Gaussian noise added to actions for the extra OOD-probe video row (0=skip row)")
 
     # logging
     p.add_argument("--log_every", type=int, default=200)
