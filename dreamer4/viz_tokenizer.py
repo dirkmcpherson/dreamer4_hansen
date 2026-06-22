@@ -57,7 +57,9 @@ def main():
     p.add_argument("--ckpt", type=str, required=True, help="tokenizer checkpoint (e.g. logs/bimanual/tok/latest.pt)")
     p.add_argument("--data_dirs", type=str, nargs="+", required=True, help="frame-shard root(s), e.g. data/bimanual_pusht/train")
     p.add_argument("--tasks", type=str, nargs="+", default=["pusht"])
-    p.add_argument("--seq_len", type=int, default=16, help="frames per clip (video length)")
+    p.add_argument("--seq_len", type=int, default=None,
+                   help="frames per clip (video length). Defaults to the tokenizer's training "
+                        "seq_len; going beyond it pushes frames out of the trained temporal context.")
     p.add_argument("--num_videos", type=int, default=4, help="number of clips shown side by side")
     p.add_argument("--fps", type=int, default=4)
     p.add_argument("--out", type=str, default="tokenizer_recon.mp4")
@@ -75,7 +77,17 @@ def main():
     H = int(tok_args.get("H", 128)); W = int(tok_args.get("W", 128))
     C = int(tok_args.get("C", 3));   patch = int(tok_args.get("patch", 4))
 
-    ds = ShardedFrameDataset(outdirs=args.data_dirs, tasks=args.tasks, seq_len=args.seq_len, iid_sampling=True)
+    # The tokenizer has causal time-attention + time pos-embeds, so clips longer than the
+    # training seq_len degrade past that horizon. Default to the trained length; warn if over.
+    train_seq_len = int(tok_args.get("seq_len", 8))
+    seq_len = train_seq_len if args.seq_len is None else int(args.seq_len)
+    if seq_len > train_seq_len:
+        print(f"[viz] WARNING: --seq_len {seq_len} exceeds the tokenizer's training seq_len "
+              f"({train_seq_len}); frames past index {train_seq_len - 1} are outside the trained "
+              f"temporal context and will look degraded.")
+    print(f"[viz] using seq_len={seq_len} (tokenizer trained at seq_len={train_seq_len})")
+
+    ds = ShardedFrameDataset(outdirs=args.data_dirs, tasks=args.tasks, seq_len=seq_len, iid_sampling=True)
     clips = [ds[i] for i in range(args.num_videos)]   # each (T,3,H,W) float in [0,1]
     frames = torch.stack(clips, dim=0).to(device)     # (B,T,3,H,W)
 
@@ -90,7 +102,7 @@ def main():
     mse = (recon.float() - frames.float()).pow(2).mean()
     psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-12))
     print(f"[viz] wrote {out}  (each clip: left=GT | right=decoded)")
-    print(f"[viz] recon MSE={mse.item():.6f}  PSNR={psnr.item():.2f} dB  over {args.num_videos} clips x {args.seq_len} frames")
+    print(f"[viz] recon MSE={mse.item():.6f}  PSNR={psnr.item():.2f} dB  over {args.num_videos} clips x {seq_len} frames")
 
     if args.wandb:
         import wandb
