@@ -17,9 +17,14 @@ Run it like the trainers (PYTHONPATH must include the dreamer4/ dir):
 Add --wandb to also log it to a wandb run.
 """
 import os
+import sys
 import argparse
 
 import torch
+
+# Make sibling modules (model.py, sharded_frame_dataset.py, train_dynamics.py) importable
+# whether or not PYTHONPATH is set -- matches how the trainers import each other.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model import temporal_patchify, temporal_unpatchify
 from sharded_frame_dataset import ShardedFrameDataset
