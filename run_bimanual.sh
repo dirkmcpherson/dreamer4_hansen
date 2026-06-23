@@ -25,19 +25,28 @@ export WANDB_MODE="${WANDB_MODE:-online}"             # set to "offline" if no n
 # hard with batch size. Keep batches modest even on a 140GB H200.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 PY="${PY:-python}"
-TOK_DIR="$REPO/logs/bimanual/tok"
-DYN_DIR="$REPO/logs/bimanual/dyn"
+TOK_DIR="${TOK_DIR:-$REPO/logs/bimanual/tok}"
+DYN_DIR="${DYN_DIR:-$REPO/logs/bimanual/dyn}"
 
 # Conservative defaults that fit ~140GB at 128^2; raise gradually watching nvidia-smi.
-# Upstream trains the tokenizer at seq_len=8 and the dynamics at seq_len=32 (by design --
-# the causal tokenizer is meant to be applied at the longer dynamics length), so the tok
-# stage intentionally uses its default seq_len and only dyn sets --seq_len 32.
 TOK_BS="${TOK_BS:-16}"
 DYN_BS="${DYN_BS:-8}"
 
+# Tokenizer training sequence length. Upstream uses 8 and relies on the causal tokenizer
+# generalizing to the longer dynamics length (32). If YOUR tokenizer doesn't extrapolate
+# (reconstructions break down past frame 8), train it at the dynamics length instead:
+#   TOK_SEQ=32 TOK_BS=4 TOK_DIR=$(pwd)/logs/bimanual/tok32 ./run_bimanual.sh tok
+# Tokenizer memory scales with batch*seq_len, so seq_len 32 needs ~4x smaller batch (16 -> 4).
+TOK_SEQ="${TOK_SEQ:-8}"
+
+# Optional resume: RESUME=/abs/path/to/latest.pt adds --resume to whichever single stage
+# you run (handy on flaky hardware). Leave empty to start fresh.
+RESUME="${RESUME:-}"
+RESUME_FLAG=""; [ -n "$RESUME" ] && RESUME_FLAG="--resume $RESUME"
+
 # Tokenizer checkpoint the dynamics stage builds on. Defaults to the tok stage's latest.pt;
-# override to pin a specific one, e.g. the upstream-faithful seq_len=8 tokenizer:
-#   TOK_CKPT=logs/bimanual/tok/step_0095000.pt ./run_bimanual.sh dyn
+# override to pin a specific one, e.g. a freshly retrained seq_len=32 tokenizer:
+#   TOK_CKPT=$(pwd)/logs/bimanual/tok32/latest.pt ./run_bimanual.sh dyn
 TOK_CKPT="${TOK_CKPT:-$TOK_DIR/latest.pt}"
 
 # Optional: gradient checkpointing trades ~25-33% compute/step for a large drop in
@@ -71,11 +80,11 @@ if has tok; then
   gate "$OUT/train/pusht.pt"
   $PY -m dreamer4.train_tokenizer \
     --data_dirs "$OUT/train" --tasks pusht \
-    --H 128 --W 128 --patch 4 \
+    --H 128 --W 128 --patch 4 --seq_len "$TOK_SEQ" \
     --batch_size "$TOK_BS" --num_workers 8 $GC_FLAG \
     --max_steps "$TOK_STEPS" --save_every 5000 --log_every 100 \
     --lpips_weight 0.2 \
-    --ckpt_dir "$TOK_DIR" \
+    --ckpt_dir "$TOK_DIR" $RESUME_FLAG \
     --wandb_project dreamer4-bimanual --wandb_run_name tokenizer
   gate "$TOK_DIR/latest.pt"
 fi
@@ -89,7 +98,7 @@ if has dyn; then
     --tokenizer_ckpt "$TOK_CKPT" \
     --batch_size "$DYN_BS" --num_workers 8 --seq_len 32 $GC_FLAG \
     --max_steps "$DYN_STEPS" --save_every 10000 \
-    --ckpt_dir "$DYN_DIR" \
+    --ckpt_dir "$DYN_DIR" $RESUME_FLAG \
     --wandb_project dreamer4-bimanual --wandb_run_name dynamics
   gate "$DYN_DIR/latest.pt"
 fi
