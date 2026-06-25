@@ -32,6 +32,15 @@ DYN_DIR="${DYN_DIR:-$REPO/logs/bimanual/dyn}"
 TOK_BS="${TOK_BS:-16}"
 DYN_BS="${DYN_BS:-8}"
 
+# Gradient accumulation for the tokenizer. At seq_len 32 the batch must shrink (16->4)
+# for memory, which starved the optimizer (effective batch ~4 highly-correlated clips)
+# and collapsed the tanh bottleneck (z saturated at +/-1, z_std->1, garbage recon).
+# TOK_GRAD_ACCUM restores the effective batch WITHOUT extra memory: BS=4 x accum=4 == 16,
+# matching the healthy seq_len=8 run. NOTE: --max_steps counts micro-batch steps, so an
+# accum of 4 yields 1/4 as many optimizer updates -- bump TOK_STEPS by the same factor
+# (e.g. TOK_GRAD_ACCUM=4 TOK_STEPS=400000) to match the seq8 update count.
+TOK_GRAD_ACCUM="${TOK_GRAD_ACCUM:-1}"
+
 # Tokenizer training sequence length. Upstream uses 8 and relies on the causal tokenizer
 # generalizing to the longer dynamics length (32). If YOUR tokenizer doesn't extrapolate
 # (reconstructions break down past frame 8), train it at the dynamics length instead:
@@ -81,7 +90,7 @@ if has tok; then
   $PY -m dreamer4.train_tokenizer \
     --data_dirs "$OUT/train" --tasks pusht \
     --H 128 --W 128 --patch 4 --seq_len "$TOK_SEQ" \
-    --batch_size "$TOK_BS" --num_workers 8 $GC_FLAG \
+    --batch_size "$TOK_BS" --grad_accum "$TOK_GRAD_ACCUM" --num_workers 8 $GC_FLAG \
     --max_steps "$TOK_STEPS" --save_every 5000 --log_every 100 \
     --lpips_weight 0.2 \
     --ckpt_dir "$TOK_DIR" $RESUME_FLAG \
