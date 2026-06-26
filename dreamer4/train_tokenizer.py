@@ -202,6 +202,7 @@ def train(args):
         mae_p_max=args.mae_p_max,
         scale_pos_embeds=args.scale_pos_embeds,
         grad_checkpoint=args.grad_checkpoint,
+        bottleneck_norm=args.bottleneck_norm,
     )
     dec = Decoder(
         d_bottleneck=args.d_bottleneck,
@@ -362,7 +363,12 @@ def train(args):
                     )
 
                 # ---- ckpt ----
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                # Do NOT gate on do_step. With grad_accum>1 the save boundary
+                # (step % save_every == 0) and the optimizer-step boundary ((step+1)%grad_accum==0)
+                # never coincide when save_every is a multiple of grad_accum (e.g. 5000 & 4),
+                # which silently disables checkpointing for the entire run. Params/opt only change
+                # on do_step anyway, so saving here always reflects the last completed update.
+                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0):
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
                     save_ckpt(ckpt_path, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
                     # also update a "latest" pointer
@@ -417,6 +423,11 @@ if __name__ == "__main__":
     # Better performance without scale_pos_embeds (set to False)
     # Set to True by default for backwards compatibility. Details here: https://github.com/nicklashansen/dreamer4/pull/4
     p.add_argument("--scale_pos_embeds", action="store_true")
+
+    # RMSNorm the residual stream before the tanh bottleneck. Guards against saturation
+    # collapse (z pinned at +/-1, z_std->1, garbage recon) that hit the seq_len=32 run.
+    # Off by default for checkpoint compat; recommended for seq_len>=16 / small-batch runs.
+    p.add_argument("--bottleneck_norm", action="store_true")
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)

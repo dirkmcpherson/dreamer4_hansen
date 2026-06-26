@@ -63,6 +63,13 @@ TOK_CKPT="${TOK_CKPT:-$TOK_DIR/latest.pt}"
 # much bigger batch, e.g.  GRAD_CKPT=1 TOK_BS=64 ./run_bimanual.sh tok
 GRAD_CKPT="${GRAD_CKPT:-0}"
 GC_FLAG=""; [ "$GRAD_CKPT" = "1" ] && GC_FLAG="--grad_checkpoint"
+
+# Guard the tanh bottleneck against saturation collapse (z pinned at +/-1, z_std->1) by
+# RMSNorm-ing the residual stream before it. The structural fix (caps the pre-activation so
+# tanh can't reach its flat tails), independent of batch size. Off by default to keep older
+# (seq8) checkpoints loadable.  TOK_BOTTLENECK_NORM=1 ./run_bimanual.sh tok
+TOK_BOTTLENECK_NORM="${TOK_BOTTLENECK_NORM:-0}"
+BN_FLAG=""; [ "$TOK_BOTTLENECK_NORM" = "1" ] && BN_FLAG="--bottleneck_norm"
 TOK_STEPS="${TOK_STEPS:-100000}"
 DYN_STEPS="${DYN_STEPS:-300000}"
 
@@ -90,7 +97,7 @@ if has tok; then
   $PY -m dreamer4.train_tokenizer \
     --data_dirs "$OUT/train" --tasks pusht \
     --H 128 --W 128 --patch 4 --seq_len "$TOK_SEQ" \
-    --batch_size "$TOK_BS" --grad_accum "$TOK_GRAD_ACCUM" --num_workers 8 $GC_FLAG \
+    --batch_size "$TOK_BS" --grad_accum "$TOK_GRAD_ACCUM" --num_workers 8 $GC_FLAG $BN_FLAG \
     --max_steps "$TOK_STEPS" --save_every 5000 --log_every 100 \
     --lpips_weight 0.2 \
     --ckpt_dir "$TOK_DIR" $RESUME_FLAG \

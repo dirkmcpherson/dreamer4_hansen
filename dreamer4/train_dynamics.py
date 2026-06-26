@@ -134,6 +134,7 @@ def load_frozen_tokenizer_from_pt_ckpt(
         mae_p_min=0.0,
         mae_p_max=0.0,
         scale_pos_embeds=bool(tok_args.get("scale_pos_embeds", True)),
+        bottleneck_norm=bool(tok_args.get("bottleneck_norm", False)),
     )
     dec = Decoder(
         d_bottleneck=int(tok_args.get("d_bottleneck", 32)),

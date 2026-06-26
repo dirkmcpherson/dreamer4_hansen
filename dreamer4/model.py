@@ -382,6 +382,7 @@ class Encoder(nn.Module):
         mae_p_max: float = 0.9,
         scale_pos_embeds: bool = True,
         grad_checkpoint: bool = False,
+        bottleneck_norm: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -390,6 +391,12 @@ class Encoder(nn.Module):
         self.scale_pos_embeds = scale_pos_embeds
 
         self.patch_proj = nn.Linear(patch_dim, d_model)
+        # The transformer has no final norm, so this raw residual stream feeds tanh unbounded.
+        # If its scale drifts, the pre-activation lands in tanh's flat tails, the gradient dies,
+        # and the bottleneck freezes at +/-1 (saturation collapse, z_std->1). RMSNorm here caps
+        # the input scale so tanh stays in its responsive band. Identity by default => old
+        # checkpoints (trained without it) still load with strict=True.
+        self.bottleneck_norm = RMSNorm(d_model) if bottleneck_norm else nn.Identity()
         self.bottleneck_proj = nn.Linear(d_model, d_bottleneck)
 
         self.layout = TokenLayout(n_latents=n_latents, segments=((Modality.IMAGE, n_patches),))
@@ -420,7 +427,7 @@ class Encoder(nn.Module):
         tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds)
 
         enc = self.transformer(tokens)
-        z = torch.tanh(self.bottleneck_proj(enc[:, :, :self.n_latents, :]))
+        z = torch.tanh(self.bottleneck_proj(self.bottleneck_norm(enc[:, :, :self.n_latents, :])))
         return z, (mae_mask, keep_prob)
 
 
